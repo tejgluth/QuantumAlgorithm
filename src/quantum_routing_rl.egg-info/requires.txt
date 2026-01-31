@@ -1,0 +1,11 @@
+qiskit>=1.0
+numpy
+networkx
+pandas
+pyarrow
+matplotlib
+torch
+
+[dev]
+pytest
+ruff

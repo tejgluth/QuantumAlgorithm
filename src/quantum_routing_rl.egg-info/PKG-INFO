@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: quantum-routing-rl
+Version: 0.1.0
+Requires-Python: >=3.11
+Requires-Dist: qiskit>=1.0
+Requires-Dist: numpy
+Requires-Dist: networkx
+Requires-Dist: pandas
+Requires-Dist: pyarrow
+Requires-Dist: matplotlib
+Requires-Dist: torch
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: ruff; extra == "dev"
