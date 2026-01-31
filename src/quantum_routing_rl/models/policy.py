@@ -339,7 +339,7 @@ def route_with_policy(
         use_teacher = bool(
             teacher_guard is not None
             and guard_target is not None
-            and state.step_count >= guard_target
+            and (state.step_count >= guard_target or state.step_count + 1 > guard_target)
         )
         if use_teacher and teacher_guard is not None:
             action = teacher_guard.select_action(state, graph, hardware)
