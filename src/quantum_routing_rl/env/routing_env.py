@@ -104,11 +104,12 @@ class RoutingEnv:
         depth_before = self._routed.depth() if self._routed is not None else 0
         twoq_before = count_two_qubit_gates(self._routed) if self._routed is not None else 0
         inst_ptr_before = self._inst_ptr
-        edge_props = (
-            self._hardware_model.get_edge_props(*edge) if self._hardware_model is not None else None
-        )
-        p2_error = edge_props.p2_error if edge_props else 0.0
-        t2_duration_ns = edge_props.t2_duration_ns if edge_props else 0.0
+        if self._hardware_model is not None:
+            p2_error, t2_duration_ns = self._hardware_model.edge_error_and_duration(
+                edge[0], edge[1], directed=True
+            )
+        else:
+            p2_error, t2_duration_ns = 0.0, 0.0
 
         self._apply_swap(edge)
         self._apply_ready_gates()

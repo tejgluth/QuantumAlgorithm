@@ -37,6 +37,9 @@ REQUIRED_COLUMNS = {
     "noise_proxy_score",
     "log_success_proxy",
     "duration_proxy",
+    "overall_log_success",
+    "total_duration_ns",
+    "decoherence_penalty",
     "seed",
     "hardware_seed",
     "qiskit_version",
@@ -149,6 +152,35 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="realistic",
         help="Synthetic hardware profile to sample.",
     )
+    parser.add_argument(
+        "--hardware-snapshots",
+        type=int,
+        default=1,
+        help="Number of drift snapshots per hardware draw (>=1).",
+    )
+    parser.add_argument(
+        "--hardware-drift",
+        type=float,
+        default=0.0,
+        help="Relative drift rate applied between snapshots (e.g., 0.05 = ±5%).",
+    )
+    parser.add_argument(
+        "--hardware-snapshot-spacing",
+        type=float,
+        default=50_000.0,
+        help="Duration in ns before switching to next hardware snapshot.",
+    )
+    parser.add_argument(
+        "--hardware-directional",
+        action="store_true",
+        help="Enable directional two-qubit error/duration samples.",
+    )
+    parser.add_argument(
+        "--hardware-crosstalk",
+        type=float,
+        default=0.01,
+        help="Crosstalk penalty factor applied to concurrent nearby two-qubit gates.",
+    )
     return parser.parse_args(argv)
 
 
@@ -232,7 +264,15 @@ def _coupling_size(map_obj: CouplingMap) -> int:
 
 
 def _build_hardware_models(
-    coupling_maps: dict[str, CouplingMap], seeds: list[int], profile: str
+    coupling_maps: dict[str, CouplingMap],
+    seeds: list[int],
+    profile: str,
+    *,
+    snapshots: int = 1,
+    drift_rate: float = 0.0,
+    snapshot_spacing_ns: float = 50_000.0,
+    directional: bool = False,
+    crosstalk_factor: float = 0.01,
 ) -> dict[str, list[HardwareModel]]:
     models: dict[str, list[HardwareModel]] = {}
     for graph_id, cmap in coupling_maps.items():
@@ -240,7 +280,17 @@ def _build_hardware_models(
         graph = nx.Graph()
         graph.add_edges_from(edges)
         models[graph_id] = [
-            HardwareModel.synthetic(graph, seed=seed, profile=profile) for seed in seeds
+            HardwareModel.synthetic(
+                graph,
+                seed=seed,
+                profile=profile,
+                directional=directional,
+                drift_rate=drift_rate,
+                snapshots=snapshots,
+                snapshot_spacing_ns=snapshot_spacing_ns,
+                crosstalk_factor=crosstalk_factor,
+            )
+            for seed in seeds
         ]
     return models
 
@@ -341,6 +391,9 @@ def _result_record(
         "noise_proxy_score": metrics.success_prob,
         "log_success_proxy": metrics.log_success_proxy,
         "duration_proxy": metrics.duration_proxy,
+        "overall_log_success": metrics.overall_log_success,
+        "total_duration_ns": metrics.total_duration_ns,
+        "decoherence_penalty": metrics.decoherence_penalty,
         "seed": seed,
         "hardware_seed": hardware_seed,
         "hardware_profile": hardware_profile,
@@ -358,6 +411,9 @@ def _write_summary(df: pd.DataFrame, path: Path) -> None:
         "noise_proxy_score",
         "log_success_proxy",
         "duration_proxy",
+        "overall_log_success",
+        "total_duration_ns",
+        "decoherence_penalty",
     ]
     agg = df.groupby(["graph_id", "baseline_name"]).agg({m: ["mean", "std"] for m in metrics})
     agg.columns = ["_".join(filter(None, col)).strip("_") for col in agg.columns.to_flat_index()]
@@ -391,7 +447,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     coupling_maps = _build_coupling_maps(args.suite)
     hardware_seeds = [args.hardware_seed_base + i for i in range(max(1, args.hardware_samples))]
-    hardware_models = _build_hardware_models(coupling_maps, hardware_seeds, args.hardware_profile)
+    hardware_models = _build_hardware_models(
+        coupling_maps,
+        hardware_seeds,
+        args.hardware_profile,
+        snapshots=max(1, args.hardware_snapshots),
+        drift_rate=max(0.0, args.hardware_drift),
+        snapshot_spacing_ns=args.hardware_snapshot_spacing,
+        directional=args.hardware_directional,
+        crosstalk_factor=max(0.0, args.hardware_crosstalk),
+    )
 
     il_ckpt = args.il_checkpoint or _default_checkpoint(out_dir, ["il_soft", "il"])
     rl_ckpt = args.rl_checkpoint or _default_checkpoint(out_dir, ["rl_ppo", "rl"])
@@ -563,6 +628,11 @@ def main(argv: list[str] | None = None) -> int:
             "include_teacher": args.include_teacher,
             "hardware_seeds": hardware_seeds,
             "hardware_profile": args.hardware_profile,
+            "hardware_snapshots": args.hardware_snapshots,
+            "hardware_drift": args.hardware_drift,
+            "hardware_snapshot_spacing": args.hardware_snapshot_spacing,
+            "hardware_directional": args.hardware_directional,
+            "hardware_crosstalk": args.hardware_crosstalk,
         }
     )
     metadata_path.write_text(json.dumps(metadata, indent=2))

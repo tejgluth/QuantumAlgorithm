@@ -119,6 +119,39 @@ def _pareto_noise(df: pd.DataFrame, out_dir: Path) -> None:
     plt.close(fig)
 
 
+def _pareto_overall_success(df: pd.DataFrame, out_dir: Path) -> None:
+    noise_df = df.dropna(subset=["overall_log_success"])
+    if noise_df.empty:
+        return
+    agg = (
+        noise_df.groupby(["graph_id", "baseline_name"])
+        .agg({"swaps_inserted": "mean", "overall_log_success": "mean"})
+        .reset_index()
+    )
+    palette = plt.get_cmap("tab10")
+    fig, ax = plt.subplots(figsize=(6, 5))
+    for idx, (baseline, subset) in enumerate(agg.groupby("baseline_name")):
+        ax.scatter(
+            subset["swaps_inserted"],
+            subset["overall_log_success"],
+            label=baseline,
+            color=palette(idx % 10),
+            s=60,
+        )
+        for _, row in subset.iterrows():
+            ax.annotate(
+                row["graph_id"], (row["swaps_inserted"], row["overall_log_success"]), fontsize=8
+            )
+    ax.set_xlabel("Swaps (mean)")
+    ax.set_ylabel("Overall log success (mean)")
+    ax.legend()
+    fig.tight_layout()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for ext in ("png", "pdf"):
+        fig.savefig(out_dir / f"pareto_overall_success.{ext}", dpi=200)
+    plt.close(fig)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     df = pd.read_csv(args.input)
@@ -147,6 +180,30 @@ def main(argv: list[str] | None = None) -> int:
                 "duration_proxy_comparison",
                 out_dir,
             )
+        if "overall_log_success" in noise_df.columns:
+            _barplots(
+                noise_df,
+                "overall_log_success",
+                "Overall log success",
+                "overall_log_success_comparison",
+                out_dir,
+            )
+        if "total_duration_ns" in noise_df.columns:
+            _barplots(
+                noise_df,
+                "total_duration_ns",
+                "Total duration (ns)",
+                "total_duration_comparison",
+                out_dir,
+            )
+        if "decoherence_penalty" in noise_df.columns:
+            _barplots(
+                noise_df,
+                "decoherence_penalty",
+                "Decoherence penalty",
+                "decoherence_penalty_comparison",
+                out_dir,
+            )
     else:
         # Write placeholder so downstream checks still succeed.
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -155,6 +212,7 @@ def main(argv: list[str] | None = None) -> int:
 
     _pareto(df, out_dir)
     _pareto_noise(df, out_dir)
+    _pareto_overall_success(df, out_dir)
     return 0
 
 
