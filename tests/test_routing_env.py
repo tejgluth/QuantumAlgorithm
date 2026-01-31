@@ -61,6 +61,8 @@ def test_random_policy_rollout_produces_valid_circuit():
     assert_coupling_compatible(routed, cmap.get_edges())
     assert count_two_qubit_gates(routed) >= count_two_qubit_gates(circuit)
     assert _non_swap_twoq_count(routed) == _non_swap_twoq_count(circuit)
+    expected_cap = min(200, 8 * count_two_qubit_gates(circuit) + 30)
+    assert state.step_count <= expected_cap
 
 
 def test_reset_schedules_ready_gates_without_swaps():

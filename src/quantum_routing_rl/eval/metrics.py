@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Iterable, Sequence
 
 from qiskit.circuit import CircuitInstruction, QuantumCircuit
+from quantum_routing_rl.hardware.model import HardwareModel
 
 
 @dataclass
@@ -19,6 +20,8 @@ class CircuitMetrics:
     depth: int
     size: int
     success_prob: float | None
+    log_success_proxy: float | None = None
+    duration_proxy: float | None = None
 
     def as_dict(self) -> dict[str, int | float | None]:
         """Dictionary view useful for DataFrame construction."""
@@ -111,15 +114,24 @@ def compute_metrics(
     *,
     backend_properties: Any | None = None,
     default_error_rate: float = 0.0,
+    hardware_model: HardwareModel | None = None,
 ) -> CircuitMetrics:
     """Compute routing metrics for a circuit."""
     swaps = count_swaps(circuit)
     two_q = count_two_qubit_gates(circuit)
     two_q_depth_val = two_qubit_depth(circuit)
-    success = success_probability_proxy(
-        circuit,
-        backend_properties=backend_properties,
-        default_error_rate=default_error_rate,
+    log_proxy = None
+    duration_proxy = None
+    if hardware_model is not None:
+        log_proxy, duration_proxy = _hardware_noise_proxies(circuit, hardware_model)
+    success = (
+        math.exp(log_proxy)
+        if log_proxy is not None
+        else success_probability_proxy(
+            circuit,
+            backend_properties=backend_properties,
+            default_error_rate=default_error_rate,
+        )
     )
     return CircuitMetrics(
         swaps=swaps,
@@ -128,6 +140,8 @@ def compute_metrics(
         depth=circuit.depth(),
         size=circuit.size(),
         success_prob=success,
+        log_success_proxy=log_proxy,
+        duration_proxy=duration_proxy,
     )
 
 
@@ -150,3 +164,38 @@ def _symmetrize_edges(edges: Iterable[Sequence[int]]) -> set[tuple[int, int]]:
         undirected.add((u, v))
         undirected.add((v, u))
     return undirected
+
+
+def _hardware_noise_proxies(
+    circuit: QuantumCircuit, hardware_model: HardwareModel
+) -> tuple[float | None, float | None]:
+    """Compute log success and decoherence proxies from a HardwareModel."""
+    log_terms: list[float] = []
+    durations_ns: list[float] = []
+    t1_samples: list[float] = []
+    for inst in circuit.data:
+        if inst.operation.num_qubits != 2:
+            continue
+        qubits = tuple(circuit.find_bit(qb).index for qb in inst.qubits)
+        try:
+            edge_props = hardware_model.get_edge_props(*qubits)
+        except KeyError:
+            continue
+        error = max(0.0, min(0.999999, edge_props.p2_error))
+        log_terms.append(math.log(1.0 - error))
+        durations_ns.append(edge_props.t2_duration_ns)
+        for q in qubits:
+            try:
+                t1_samples.append(hardware_model.get_qubit_props(q).t1_ns)
+            except KeyError:
+                continue
+
+    log_proxy = sum(log_terms) if log_terms else None
+    duration_proxy = None
+    if durations_ns:
+        total_duration = sum(durations_ns)
+        if t1_samples:
+            duration_proxy = -total_duration / (sum(t1_samples) / len(t1_samples))
+        else:
+            duration_proxy = -total_duration / 1_000_000.0
+    return log_proxy, duration_proxy

@@ -19,5 +19,8 @@ class RoutingState:
     lookahead: List[LogicalGate]
     candidate_swaps: List[PhysicalSwap]
     action_mask: List[bool]
+    frontier_phys: Tuple[int, int] | None
+    frontier_distance: float | None
     step_count: int
     done: bool
+    recent_swaps: List[PhysicalSwap]

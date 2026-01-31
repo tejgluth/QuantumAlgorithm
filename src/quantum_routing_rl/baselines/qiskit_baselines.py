@@ -9,6 +9,7 @@ from typing import Any, Sequence
 from qiskit import transpile
 from qiskit.circuit import QuantumCircuit
 from qiskit.transpiler import CouplingMap
+from qiskit.transpiler.exceptions import TranspilerError
 
 from quantum_routing_rl.eval.metrics import (
     CircuitMetrics,
@@ -47,6 +48,7 @@ def run_sabre_layout_swap(
     basis_gates: Sequence[str] | None = None,
     seed: int | None = None,
     optimization_level: int = 1,
+    hardware_model=None,
 ) -> BaselineResult:
     """SabreLayout + SabreSwap baseline via ``transpile``."""
     transpile_opts = dict(
@@ -57,7 +59,9 @@ def run_sabre_layout_swap(
         optimization_level=optimization_level,
         seed_transpiler=seed,
     )
-    return _run_baseline("sabre_layout_swap", circuit, transpile_opts, coupling_map)
+    return _run_baseline(
+        "sabre_layout_swap", circuit, transpile_opts, coupling_map, hardware_model=hardware_model
+    )
 
 
 def run_best_available_sabre(
@@ -66,6 +70,7 @@ def run_best_available_sabre(
     *,
     basis_gates: Sequence[str] | None = None,
     seed: int | None = None,
+    hardware_model=None,
 ) -> BaselineResult:
     """Use Qiskit's highest preset (optimization_level=3) with SABRE routing."""
     transpile_opts = dict(
@@ -76,7 +81,9 @@ def run_best_available_sabre(
         optimization_level=3,
         seed_transpiler=seed,
     )
-    return _run_baseline("qiskit_sabre_best", circuit, transpile_opts, coupling_map)
+    return _run_baseline(
+        "qiskit_sabre_best", circuit, transpile_opts, coupling_map, hardware_model=hardware_model
+    )
 
 
 def _run_baseline(
@@ -84,9 +91,17 @@ def _run_baseline(
     circuit: QuantumCircuit,
     transpile_opts: dict[str, Any],
     coupling_map: CouplingMap | Sequence[Sequence[int]] | None,
+    hardware_model=None,
 ) -> BaselineResult:
+    fallback_used = False
     start = time.perf_counter()
-    routed = transpile(circuit, **transpile_opts)
+    try:
+        routed = transpile(circuit, **transpile_opts)
+    except TranspilerError:
+        fallback_used = True
+        fallback_opts = dict(transpile_opts)
+        fallback_opts["optimization_level"] = 1
+        routed = transpile(circuit, **fallback_opts)
     runtime = time.perf_counter() - start
 
     cmap_edges: list[tuple[int, int]] | None = None
@@ -94,7 +109,7 @@ def _run_baseline(
         cmap_edges = _normalize_edges(coupling_map)
         assert_coupling_compatible(routed, cmap_edges)
 
-    metrics = compute_metrics(routed)
+    metrics = compute_metrics(routed, hardware_model=hardware_model)
     extra = {
         k: v
         for k, v in transpile_opts.items()
@@ -102,6 +117,8 @@ def _run_baseline(
     }
     if cmap_edges is not None:
         extra["coupling_map"] = cmap_edges
+    if fallback_used:
+        extra["fallback"] = "optimization_level_1"
     return BaselineResult(
         name=name,
         circuit=routed,
