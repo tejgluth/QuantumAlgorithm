@@ -23,20 +23,22 @@ from quantum_routing_rl.benchmarks.synthetic_generator import (
     generate_pressure_circuit,
     pressure_suite,
 )
-from quantum_routing_rl.env.routing_env import RoutingEnv
+from quantum_routing_rl.env.routing_env import RoutingEnv, RoutingEnvConfig
 from quantum_routing_rl.models.policy import (
     SwapPolicy,
-    candidate_features,
     _match_feature_dim,
+    candidate_features,
     route_with_policy,
     state_features,
+    _scores_to_logits,
 )
-from quantum_routing_rl.models.teacher import TeacherPolicy, TeacherWeights
+from quantum_routing_rl.models.teacher import TeacherPolicy, TeacherWeights, _sabre_initial_layout
 from quantum_routing_rl.hardware.model import HardwareModel
 
 
-FEATURE_VERSION = "il_soft_v2"
-DATASET_VERSION = "il_dataset_iter2"
+FEATURE_VERSION = "il_soft_v3"
+DATASET_VERSION = "il_dataset_dagger_v3"
+FRONTIER_SIZE = 4
 
 
 @dataclass(frozen=True)
@@ -179,6 +181,35 @@ def _build_hardware_models(
     return models
 
 
+def _reservoir_update(
+    reservoir: list[TraceSample],
+    new_samples: list[TraceSample],
+    *,
+    cap: int | None,
+    rng: random.Random,
+) -> list[TraceSample]:
+    """Reservoir-sample new_samples into reservoir up to `cap` items."""
+
+    if cap is None or cap <= 0:
+        reservoir.extend(new_samples)
+        return reservoir
+
+    # Trim existing reservoir if it already exceeds the cap.
+    if len(reservoir) > cap:
+        reservoir = rng.sample(reservoir, cap)
+
+    total_seen = len(reservoir)
+    for sample in new_samples:
+        total_seen += 1
+        if len(reservoir) < cap:
+            reservoir.append(sample)
+            continue
+        idx = rng.randrange(total_seen)
+        if idx < cap:
+            reservoir[idx] = sample
+    return reservoir
+
+
 def record_traces_for_circuit(
     circuit: QasmCircuit,
     coupling_map: CouplingMap,
@@ -190,8 +221,15 @@ def record_traces_for_circuit(
     hardware_seed: int | None = None,
 ) -> List[TraceSample]:
     """Run teacher policy in the environment and collect labelled steps."""
-    env = RoutingEnv()
-    state = env.reset(circuit.circuit, coupling_map, seed=seed, hardware_model=hardware_model)
+    env = RoutingEnv(RoutingEnvConfig(frontier_size=FRONTIER_SIZE))
+    initial_layout = _sabre_initial_layout(circuit.circuit, coupling_map, seed=seed)
+    state = env.reset(
+        circuit.circuit,
+        coupling_map,
+        seed=seed,
+        hardware_model=hardware_model,
+        initial_layout=initial_layout,
+    )
     graph = nx.Graph(list(coupling_map.get_edges()))
     hardware = env.hardware_model
     samples: List[TraceSample] = []
@@ -229,6 +267,84 @@ def record_traces_for_circuit(
     return samples
 
 
+def rollout_policy_traces(
+    model: SwapPolicy,
+    circuit: QasmCircuit,
+    coupling_map: CouplingMap,
+    *,
+    seed: int,
+    graph_id: str,
+    teacher: TeacherPolicy,
+    hardware_model: HardwareModel | None,
+    hardware_seed: int | None,
+    dagger_round: int,
+) -> list[TraceSample]:
+    """Roll out a learned policy (unguarded) while labelling with teacher scores."""
+
+    env = RoutingEnv(RoutingEnvConfig(frontier_size=FRONTIER_SIZE))
+    initial_layout = _sabre_initial_layout(circuit.circuit, coupling_map, seed=seed)
+    state = env.reset(
+        circuit.circuit,
+        coupling_map,
+        seed=seed,
+        hardware_model=hardware_model,
+        initial_layout=initial_layout,
+    )
+    graph = nx.Graph(list(coupling_map.get_edges()))
+    hardware = env.hardware_model
+    teacher.begin_episode(graph)
+
+    samples: list[TraceSample] = []
+    step = 0
+    while not state.done:
+        cand_feats = candidate_features(state, graph, hardware)
+        state_feats = state_features(state, graph)
+        teacher_scores = torch.tensor(
+            teacher.score_candidates(state, graph, hardware), dtype=torch.float32
+        )
+        mask = torch.tensor(state.action_mask, dtype=torch.bool)
+        finite_scores = teacher_scores.masked_fill(~mask, torch.tensor(float("inf")))
+        teacher_action = int(torch.argmin(finite_scores).item())
+
+        policy_feats = torch.cat(
+            [cand_feats, state_feats.unsqueeze(0).repeat(cand_feats.shape[0], 1)], dim=1
+        )
+        policy_feats = _match_feature_dim(policy_feats, model.net[0].in_features)  # type: ignore[index]
+        logits = _scores_to_logits(model(policy_feats), model)
+        logits = logits.masked_fill(~mask, -1e9)
+        if not mask.any():
+            policy_action = teacher_action
+        else:
+            policy_action = int(torch.argmax(logits).item())
+
+        samples.append(
+            TraceSample(
+                candidate_features=cand_feats.cpu(),
+                state_features=state_feats.cpu(),
+                teacher_scores=teacher_scores.cpu(),
+                action_mask=mask.cpu(),
+                label=teacher_action,
+                meta={
+                    "circuit_id": circuit.circuit_id,
+                    "graph_id": graph_id,
+                    "step": step,
+                    "candidate_swaps": list(state.candidate_swaps),
+                    "hardware_seed": hardware_seed,
+                    "policy_action": policy_action,
+                    "teacher_action": teacher_action,
+                    "feature_version": FEATURE_VERSION,
+                    "dagger_round": dagger_round,
+                },
+            )
+        )
+
+        swap_edge = state.candidate_swaps[policy_action]
+        state, _, _, _ = env.step(policy_action)
+        teacher.update_after_action(swap_edge, state.step_count)
+        step += 1
+    return samples
+
+
 def collect_dataset(
     suite: dict[str, list[QasmCircuit]],
     coupling_maps: dict[str, CouplingMap],
@@ -255,6 +371,44 @@ def collect_dataset(
                         hardware_model=hw_model,
                         hardware_seed=hw_seed,
                         teacher=teacher,
+                    )
+                )
+    return all_samples
+
+
+def collect_dagger_dataset(
+    model: SwapPolicy,
+    suite: dict[str, list[QasmCircuit]],
+    coupling_maps: dict[str, CouplingMap],
+    *,
+    seed: int,
+    hardware_models: dict[str, list[tuple[int, HardwareModel]]],
+    teacher_weights: TeacherWeights,
+    dagger_round: int,
+    rng: random.Random,
+) -> list[TraceSample]:
+    """Collect DAgger traces from policy rollouts labelled by the teacher."""
+
+    teacher = TeacherPolicy(weights=teacher_weights)
+    all_samples: list[TraceSample] = []
+    for graph_id, circuits in suite.items():
+        cmap = coupling_maps[graph_id]
+        hw_list = hardware_models.get(graph_id, [(None, None)])
+        circuits_iter = list(circuits)
+        rng.shuffle(circuits_iter)
+        for hw_seed, hw_model in hw_list:
+            for circuit in circuits_iter:
+                all_samples.extend(
+                    rollout_policy_traces(
+                        model,
+                        circuit,
+                        cmap,
+                        seed=seed,
+                        graph_id=graph_id,
+                        teacher=teacher,
+                        hardware_model=hw_model,
+                        hardware_seed=hw_seed,
+                        dagger_round=dagger_round,
                     )
                 )
     return all_samples
@@ -324,13 +478,16 @@ def train_model(
     tau_start: float = 1.0,
     tau_end: float = 0.3,
     tau: float | None = None,
-    top_k: int | None = None,
     patience: int = 5,
     val_split: float = 0.1,
     seed: int = 0,
-    hard_weight: float = 0.2,
+    hard_weight: float = 0.05,
     max_train_samples: int | None = None,
     hidden_dim: int = 192,
+    top_k: int | None = None,
+    mse_weight: float = 1.0,
+    rank_weight: float = 0.5,
+    score_mode: str = "min",
 ) -> tuple[SwapPolicy, list[dict]]:
     if tau is not None:
         tau_start = tau_end = tau
@@ -344,13 +501,17 @@ def train_model(
     model = SwapPolicy(
         feature_dim=feature_dim or SwapPolicy().net[0].in_features,
         hidden_dim=hidden_dim,
+        score_mode=score_mode,
     ).to(device)
+    model.score_mode = score_mode
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     history: list[dict] = []
 
     rng = random.Random(seed)
     torch.manual_seed(seed)
     hard_wt = max(0.0, min(1.0, hard_weight))
+    mse_wt = max(0.0, mse_weight)
+    rank_wt = max(0.0, rank_weight)
 
     def _tau_for_epoch(epoch: int) -> float:
         if epochs <= 1:
@@ -369,31 +530,44 @@ def train_model(
         feats = torch.cat([cand, tiled_state], dim=1)
         return _match_feature_dim(feats, model.net[0].in_features)  # type: ignore[index]
 
-    def _soft_targets(sample: TraceSample, tau_value: float) -> torch.Tensor:
-        scores = sample.teacher_scores.to(device)
+    def _compute_losses(
+        sample: TraceSample, tau_value: float
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         mask = sample.action_mask.to(device)
-        masked = scores.masked_fill(~mask, torch.tensor(float("inf"), device=device))
+        if not mask.any():
+            return None
+        feats = _assemble_features(sample)
+        pred_scores = model(feats)
+        teacher_scores = sample.teacher_scores.to(device)
 
-        effective_mask = mask
-        if top_k is not None and top_k > 0 and mask.any():
-            allowed_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
-            allowed_scores = masked[mask]
-            k = min(top_k, allowed_scores.numel())
-            # Select k best (lowest) scores.
-            _, top_positions = torch.topk(-allowed_scores, k)
-            keep_idx = allowed_idx[top_positions]
-            keep_mask = torch.zeros_like(mask, dtype=torch.bool, device=device)
-            keep_mask[keep_idx] = True
-            masked = masked.masked_fill(~keep_mask, torch.tensor(float("inf"), device=device))
-            effective_mask = keep_mask
-        # Stable softmax over allowed actions.
-        scaled = -masked / max(tau_value, 1e-6)
-        probs = torch.zeros_like(scaled, device=device)
-        if effective_mask.any():
-            probs[effective_mask] = torch.softmax(scaled[effective_mask], dim=-1)
-        if float(probs.sum().item()) == 0.0:
-            probs = torch.ones_like(probs, device=device) / len(probs)
-        return probs
+        pred_valid = pred_scores[mask]
+        teacher_valid = teacher_scores[mask]
+
+        if top_k is not None and top_k > 0 and teacher_valid.numel() > top_k:
+            # Use teacher ordering to select top-k actions and keep tensors aligned.
+            _, top_idx = torch.topk(-teacher_valid, k=top_k)
+            teacher_valid = teacher_valid[top_idx]
+            pred_valid = pred_valid[top_idx]
+        if teacher_valid.numel() == 0:
+            return None
+
+        # Center scores to stabilise regression and ranking.
+        teacher_center = teacher_valid - teacher_valid.mean()
+        pred_center = pred_valid - pred_valid.mean()
+
+        mse_loss = F.mse_loss(pred_center, teacher_center)
+        temp = max(tau_value, 1e-6)
+        teacher_probs = torch.softmax(-teacher_center / temp, dim=-1)
+        pred_probs = torch.softmax(-pred_center / temp, dim=-1)
+        rank_loss = F.kl_div(
+            torch.log(pred_probs + 1e-8), teacher_probs, reduction="batchmean", log_target=False
+        )
+
+        hard_loss = torch.tensor(0.0, device=device)
+        if hard_wt > 0:
+            best_idx = torch.argmin(teacher_center)
+            hard_loss = F.cross_entropy((-pred_center).unsqueeze(0), best_idx.unsqueeze(0))
+        return mse_loss, rank_loss, hard_loss
 
     val_size = max(1, int(len(samples) * val_split)) if samples else 0
     rng.shuffle(samples)
@@ -407,46 +581,54 @@ def train_model(
     for epoch in range(epochs):
         rng.shuffle(train_samples)
         total_loss = 0.0
+        mse_total = 0.0
+        rank_total = 0.0
+        hard_total = 0.0
+        seen = 0
         epoch_samples = train_samples
         if max_train_samples is not None and len(epoch_samples) > max_train_samples:
             epoch_samples = epoch_samples[:max_train_samples]
         tau_value = _tau_for_epoch(epoch)
         for sample in epoch_samples:
-            feats = _assemble_features(sample)
-            logits = model(feats)
-            mask = sample.action_mask.to(device)
-            logits = logits.masked_fill(~mask, -1e9)
-            targets = _soft_targets(sample, tau_value)
-            log_probs = torch.log_softmax(logits, dim=-1)
-            loss_soft = F.kl_div(log_probs, targets, reduction="batchmean", log_target=False)
-            label_tensor = torch.tensor([sample.label], dtype=torch.long, device=device)
-            loss_hard = F.cross_entropy(logits.unsqueeze(0), label_tensor)
-            loss = (1 - hard_wt) * loss_soft + hard_wt * loss_hard
+            losses = _compute_losses(sample, tau_value)
+            if losses is None:
+                continue
+            mse_loss, rank_loss, hard_loss = losses
+            loss = mse_wt * mse_loss + rank_wt * rank_loss + hard_wt * hard_loss
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             total_loss += float(loss.item())
-        train_loss = total_loss / max(1, len(train_samples))
+            mse_total += float(mse_loss.item())
+            rank_total += float(rank_loss.item())
+            hard_total += float(hard_loss.item())
+            seen += 1
+        train_loss = total_loss / max(1, seen)
 
         # Validation
         with torch.no_grad():
             val_total = 0.0
+            val_seen = 0
             for sample in val_samples:
-                feats = _assemble_features(sample)
-                logits = model(feats)
-                mask = sample.action_mask.to(device)
-                logits = logits.masked_fill(~mask, -1e9)
-                targets = _soft_targets(sample, tau_value)
-                log_probs = torch.log_softmax(logits, dim=-1)
-                loss_soft = F.kl_div(log_probs, targets, reduction="batchmean", log_target=False)
-                label_tensor = torch.tensor([sample.label], dtype=torch.long, device=device)
-                loss_hard = F.cross_entropy(logits.unsqueeze(0), label_tensor)
-                loss = (1 - hard_wt) * loss_soft + hard_wt * loss_hard
+                losses = _compute_losses(sample, tau_value)
+                if losses is None:
+                    continue
+                mse_loss, rank_loss, hard_loss = losses
+                loss = mse_wt * mse_loss + rank_wt * rank_loss + hard_wt * hard_loss
                 val_total += float(loss.item())
-            val_loss = val_total / max(1, len(val_samples))
+                val_seen += 1
+            val_loss = val_total / max(1, val_seen)
 
         history.append(
-            {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "tau": tau_value}
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "tau": tau_value,
+                "mse": mse_total / max(1, seen),
+                "rank": rank_total / max(1, seen),
+                "hard": hard_total / max(1, seen),
+            }
         )
 
         if epoch == 0 or (epoch + 1) % 5 == 0 or epoch == epochs - 1:
@@ -482,8 +664,11 @@ def save_checkpoint(
     tau: float | None = None,
     top_k: int | None = None,
     hard_weight: float,
+    mse_weight: float,
+    rank_weight: float,
     max_train_samples: int | None = None,
     hidden_dim: int = 192,
+    score_mode: str = "min",
 ) -> None:
     if tau is not None:
         tau_start = tau_end = tau
@@ -501,9 +686,12 @@ def save_checkpoint(
             "tau_end": tau_end,
             "top_k": top_k,
             "hard_weight": hard_weight,
+            "mse_weight": mse_weight,
+            "rank_weight": rank_weight,
             "feature_version": FEATURE_VERSION,
             "max_train_samples": max_train_samples,
             "hidden_dim": hidden_dim,
+            "score_mode": score_mode,
         },
         path,
     )
@@ -540,8 +728,27 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--hard-weight",
         type=float,
-        default=0.7,
-        help="Weight for hard-label cross-entropy term (0-1).",
+        default=0.05,
+        help="Weight for optional hard-label cross-entropy term (0-1).",
+    )
+    parser.add_argument(
+        "--mse-weight",
+        type=float,
+        default=1.0,
+        help="Weight for teacher score regression term.",
+    )
+    parser.add_argument(
+        "--rank-weight",
+        type=float,
+        default=0.5,
+        help="Weight for listwise ranking loss.",
+    )
+    parser.add_argument(
+        "--score-mode",
+        type=str,
+        default="min",
+        choices=["min", "max"],
+        help="Whether lower (min) or higher (max) model outputs are preferred.",
     )
     parser.add_argument(
         "--hidden-dim",
@@ -605,6 +812,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=120_000,
         help="Cap on number of training samples per epoch (after shuffling).",
     )
+    parser.add_argument(
+        "--dagger-rounds",
+        type=int,
+        default=5,
+        help="Number of DAgger iterations after initial supervised fit.",
+    )
+    parser.add_argument(
+        "--dagger-cap",
+        type=int,
+        default=450_000,
+        help="Reservoir sampling cap for IL dataset size (0 = unlimited).",
+    )
+    parser.add_argument(
+        "--dagger-seed",
+        type=int,
+        default=37,
+        help="Random seed for DAgger shuffling/reservoir updates.",
+    )
     return parser.parse_args(argv)
 
 
@@ -616,6 +841,7 @@ def main(argv: list[str] | None = None) -> int:
     tau_start = args.tau if args.tau is not None else args.tau_start
     tau_end = args.tau if args.tau is not None else args.tau_end
     top_k = args.soft_top_k if args.soft_top_k and args.soft_top_k > 0 else None
+    rng = random.Random(args.dagger_seed)
 
     graphs = [g.strip() for g in args.graphs.split(",") if g.strip()]
     if args.fast:
@@ -623,6 +849,8 @@ def main(argv: list[str] | None = None) -> int:
         args.num_hardware_seeds = max(3, args.num_hardware_seeds // 3)
         args.epochs = max(5, args.epochs // 3)
         args.patience = min(args.patience, 3)
+        args.dagger_rounds = max(1, min(args.dagger_rounds, 2))
+        args.dagger_cap = min(args.dagger_cap, 200_000) if args.dagger_cap else args.dagger_cap
 
     dataset_path = out_dir / "datasets" / "il_soft_traces.pt"
     coupling_maps = _build_coupling_maps(graphs)
@@ -637,6 +865,9 @@ def main(argv: list[str] | None = None) -> int:
         graphs, num_seeds=len(circuit_seeds), base_seed=circuit_seeds[0]
     )
     synthetic_suite = _augment_with_pressure(synthetic_suite, graphs, args.pressure_seed)
+    dagger_suite: dict[str, list[QasmCircuit]] = _augment_with_pressure(
+        {}, graphs, args.pressure_seed
+    )
     hardware_models = _build_hardware_models(
         coupling_maps, hardware_seeds, profile=args.hardware_profile
     )
@@ -647,6 +878,7 @@ def main(argv: list[str] | None = None) -> int:
         return (
             meta.get("dataset_version") != DATASET_VERSION
             or meta.get("feature_version") != FEATURE_VERSION
+            or meta.get("frontier_size") != FRONTIER_SIZE
             or meta.get("graphs") != graphs
             or meta.get("num_circuit_seeds") != len(circuit_seeds)
             or meta.get("num_hardware_seeds") != len(hardware_seeds)
@@ -654,6 +886,7 @@ def main(argv: list[str] | None = None) -> int:
             or meta.get("pressure_seed") != args.pressure_seed
             or meta.get("circuit_seed_base") != args.circuit_seed_base
             or meta.get("hardware_seed_base") != args.hardware_seed_base
+            or meta.get("score_mode") != args.score_mode
         )
 
     samples: list[TraceSample]
@@ -685,6 +918,14 @@ def main(argv: list[str] | None = None) -> int:
                 "pressure_circuits": [
                     c.circuit_id for c in pressure_suite(seed=args.pressure_seed)
                 ],
+                "frontier_size": FRONTIER_SIZE,
+                "dagger_rounds": 0,
+                "dagger_cap": args.dagger_cap,
+                "dagger_seed": args.dagger_seed,
+                "score_mode": args.score_mode,
+                "mse_weight": args.mse_weight,
+                "rank_weight": args.rank_weight,
+                "hard_weight": args.hard_weight,
             },
         )
     else:
@@ -716,36 +957,108 @@ def main(argv: list[str] | None = None) -> int:
                     "pressure_circuits": [
                         c.circuit_id for c in pressure_suite(seed=args.pressure_seed)
                     ],
+                    "frontier_size": FRONTIER_SIZE,
+                    "dagger_rounds": 0,
+                    "dagger_cap": args.dagger_cap,
+                    "dagger_seed": args.dagger_seed,
+                    "score_mode": args.score_mode,
+                    "mse_weight": args.mse_weight,
+                    "rank_weight": args.rank_weight,
+                    "hard_weight": args.hard_weight,
                 },
             )
+        else:
+            dataset_meta.setdefault("dagger_rounds", 0)
+            dataset_meta["dagger_cap"] = args.dagger_cap
+            dataset_meta["dagger_seed"] = args.dagger_seed
+            dataset_meta["score_mode"] = args.score_mode
+            dataset_meta.setdefault("frontier_size", FRONTIER_SIZE)
+            dataset_meta.setdefault("mse_weight", args.mse_weight)
+            dataset_meta.setdefault("rank_weight", args.rank_weight)
+            dataset_meta.setdefault("hard_weight", args.hard_weight)
 
-    model, history = train_model(
-        samples,
-        epochs=args.epochs,
-        lr=args.lr,
-        tau_start=tau_start,
-        tau_end=tau_end,
-        top_k=top_k,
-        patience=args.patience,
-        val_split=args.val_split,
-        seed=args.seed,
-        hard_weight=args.hard_weight,
-        max_train_samples=args.max_train_samples,
-        hidden_dim=args.hidden_dim,
-    )
+    # Enforce reservoir cap on pre-existing data.
+    samples = _reservoir_update(samples, [], cap=args.dagger_cap, rng=rng)
+    prev_num = dataset_meta.get("num_samples", len(samples))
+    dataset_meta["num_samples"] = len(samples)
+    if (
+        len(samples) != prev_num
+        and dataset_meta.get("path")
+        and Path(dataset_meta["path"]).exists()
+    ):
+        # Refresh dataset on disk if we trimmed to the cap.
+        dataset_meta = save_dataset(samples, dataset_path, metadata=dataset_meta)
+
+    history_all: list[dict] = []
+
+    def _train_round(round_idx: int, current_samples: list[TraceSample]) -> SwapPolicy:
+        model, hist = train_model(
+            current_samples,
+            epochs=args.epochs,
+            lr=args.lr,
+            tau_start=tau_start,
+            tau_end=tau_end,
+            top_k=top_k,
+            patience=args.patience,
+            val_split=args.val_split,
+            seed=args.seed + round_idx,
+            hard_weight=args.hard_weight,
+            max_train_samples=args.max_train_samples,
+            hidden_dim=args.hidden_dim,
+            mse_weight=args.mse_weight,
+            rank_weight=args.rank_weight,
+            score_mode=args.score_mode,
+        )
+        history_all.extend([{**rec, "round": round_idx} for rec in hist])
+        return model
+
+    model = _train_round(0, samples)
+
+    for round_idx in range(1, args.dagger_rounds + 1):
+        dagger_samples = collect_dagger_dataset(
+            model,
+            dagger_suite,
+            coupling_maps,
+            seed=args.seed + round_idx,
+            hardware_models=hardware_models,
+            teacher_weights=TeacherWeights(),
+            dagger_round=round_idx,
+            rng=rng,
+        )
+        samples = _reservoir_update(samples, dagger_samples, cap=args.dagger_cap, rng=rng)
+        dataset_meta.update(
+            {
+                "dagger_rounds": round_idx,
+                "dagger_cap": args.dagger_cap,
+                "dagger_seed": args.dagger_seed,
+                "dagger_added": dataset_meta.get("dagger_added", 0) + len(dagger_samples),
+                "score_mode": args.score_mode,
+                "mse_weight": args.mse_weight,
+                "rank_weight": args.rank_weight,
+                "hard_weight": args.hard_weight,
+                "dataset_version": DATASET_VERSION,
+            }
+        )
+        dataset_meta["num_samples"] = len(samples)
+        dataset_meta = save_dataset(samples, dataset_path, metadata=dataset_meta)
+        model = _train_round(round_idx, samples)
+
     ckpt_path = out_dir / "checkpoints" / "il_soft.pt"
     save_checkpoint(
         model,
         ckpt_path,
         epochs=args.epochs,
         seed=args.seed,
-        loss_history=history,
+        loss_history=history_all,
         tau_start=tau_start,
         tau_end=tau_end,
         top_k=top_k,
         hard_weight=args.hard_weight,
+        mse_weight=args.mse_weight,
+        rank_weight=args.rank_weight,
         max_train_samples=args.max_train_samples,
         hidden_dim=args.hidden_dim,
+        score_mode=args.score_mode,
     )
 
     # Quick smoke rollout on first circuit (if any) to ensure checkpoint usable.
@@ -769,6 +1082,9 @@ def main(argv: list[str] | None = None) -> int:
                 "il_tau_end": tau_end,
                 "il_top_k": top_k,
                 "il_hard_weight": args.hard_weight,
+                "il_mse_weight": args.mse_weight,
+                "il_rank_weight": args.rank_weight,
+                "il_score_mode": args.score_mode,
                 "il_graphs": graphs,
                 "il_circuit_seeds": circuit_seeds,
                 "il_hardware_seeds": hardware_seeds,
@@ -776,13 +1092,17 @@ def main(argv: list[str] | None = None) -> int:
                 "il_hidden_dim": args.hidden_dim,
                 "il_dataset_version": DATASET_VERSION,
                 "il_feature_version": FEATURE_VERSION,
+                "il_frontier_size": FRONTIER_SIZE,
                 "il_history_path": str(out_dir / "training" / "il_soft.json"),
+                "il_dagger_rounds": args.dagger_rounds,
+                "il_dagger_cap": args.dagger_cap,
+                "il_dagger_seed": args.dagger_seed,
             },
         )
 
     history_path = out_dir / "training" / "il_soft.json"
     history_path.parent.mkdir(parents=True, exist_ok=True)
-    history_path.write_text(json.dumps(history, indent=2))
+    history_path.write_text(json.dumps(history_all, indent=2))
     return 0
 
 

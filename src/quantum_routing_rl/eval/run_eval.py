@@ -22,6 +22,10 @@ from quantum_routing_rl.baselines.qiskit_baselines import (
 from quantum_routing_rl.benchmarks.qasmbench_loader import QasmCircuit, load_suite
 from quantum_routing_rl.benchmarks.synthetic_generator import pressure_suite
 from quantum_routing_rl.models.policy import load_swap_policy, route_with_policy
+from quantum_routing_rl.models.residual_policy import (
+    load_residual_policy,
+    route_with_residual_policy,
+)
 from quantum_routing_rl.models.teacher import route_with_teacher
 from quantum_routing_rl.hardware.model import HardwareModel
 
@@ -68,6 +72,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         help="Optional summary filename (defaults to results-name with 'summary').",
     )
+    parser.add_argument(
+        "--summary-std-name",
+        type=str,
+        help="Optional std-dev summary filename (defaults to summary-name with '_std').",
+    )
     parser.add_argument("--seed", type=int, help="Single seed (deprecated, prefer --seeds).")
     parser.add_argument(
         "--seeds",
@@ -109,6 +118,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="If set, fall back to teacher when IL swaps exceed guard * teacher swaps.",
     )
     parser.add_argument(
+        "--il-no-fallback",
+        action="store_true",
+        help="Disable teacher fallback when IL policy stalls (unguarded evaluation).",
+    )
+    parser.add_argument(
         "--rl-checkpoint",
         type=Path,
         help="Optional path to an RL checkpoint to evaluate alongside baselines.",
@@ -128,6 +142,33 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--rl-swap-guard",
         type=float,
         help="If set, fall back to teacher when RL swaps exceed guard * teacher swaps.",
+    )
+    parser.add_argument(
+        "--rl-no-fallback",
+        action="store_true",
+        help="Disable teacher fallback when RL policy stalls (unguarded evaluation).",
+    )
+    parser.add_argument(
+        "--residual-checkpoint",
+        type=Path,
+        help="Optional path to a residual_topk checkpoint to evaluate.",
+    )
+    parser.add_argument(
+        "--residual-top-k",
+        type=int,
+        default=8,
+        help="Top-K teacher candidates passed to residual scorer.",
+    )
+    parser.add_argument(
+        "--residual-no-fallback",
+        action="store_true",
+        help="Disable teacher fallback/uncertainty guard for residual policy.",
+    )
+    parser.add_argument(
+        "--residual-teacher-bias",
+        type=float,
+        default=0.0,
+        help="Blend teacher score into residual utilities (larger = closer to teacher).",
     )
     parser.add_argument(
         "--include-teacher",
@@ -376,7 +417,7 @@ def _result_record(
     hardware_profile: str | None = None,
 ) -> dict[str, object]:
     metrics = result.metrics
-    return {
+    record = {
         "suite": suite,
         "circuit_id": circuit.circuit_id,
         "path": circuit.path.as_posix(),
@@ -399,9 +440,12 @@ def _result_record(
         "hardware_profile": hardware_profile,
         "qiskit_version": qiskit_version,
     }
+    extra = getattr(result, "extra", {}) or {}
+    record.update(extra)
+    return record
 
 
-def _write_summary(df: pd.DataFrame, path: Path) -> None:
+def _write_summary(df: pd.DataFrame, mean_path: Path, std_path: Path | None = None) -> None:
     metrics = [
         "swaps_inserted",
         "twoq_count",
@@ -416,10 +460,20 @@ def _write_summary(df: pd.DataFrame, path: Path) -> None:
         "decoherence_penalty",
     ]
     agg = df.groupby(["graph_id", "baseline_name"]).agg({m: ["mean", "std"] for m in metrics})
-    agg.columns = ["_".join(filter(None, col)).strip("_") for col in agg.columns.to_flat_index()]
-    agg = agg.reset_index()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    agg.to_csv(path, index=False)
+
+    def _stat_df(stat: str) -> pd.DataFrame:
+        sub = agg.xs(stat, level=1, axis=1)
+        sub.columns = [f"{col}_{stat}" for col in sub.columns]
+        return sub.reset_index()
+
+    mean_df = _stat_df("mean")
+    std_df = _stat_df("std")
+
+    mean_path.parent.mkdir(parents=True, exist_ok=True)
+    mean_df.to_csv(mean_path, index=False)
+    if std_path is not None:
+        std_path.parent.mkdir(parents=True, exist_ok=True)
+        std_df.to_csv(std_path, index=False)
 
 
 def _default_checkpoint(out_dir: Path, names: Iterable[str]) -> Path | None:
@@ -460,6 +514,7 @@ def main(argv: list[str] | None = None) -> int:
 
     il_ckpt = args.il_checkpoint or _default_checkpoint(out_dir, ["il_soft", "il"])
     rl_ckpt = args.rl_checkpoint or _default_checkpoint(out_dir, ["rl_ppo", "rl"])
+    residual_ckpt = args.residual_checkpoint or _default_checkpoint(out_dir, ["residual_topk"])
     il_name = args.il_name
     if il_name is None:
         if il_ckpt and "il_soft" in il_ckpt.name:
@@ -472,8 +527,21 @@ def main(argv: list[str] | None = None) -> int:
             rl_name = "rl_ppo"
         else:
             rl_name = "rl_policy"
+    residual_name = "residual_topk"
     il_model = load_swap_policy(il_ckpt) if il_ckpt and Path(il_ckpt).exists() else None
     rl_model = load_swap_policy(rl_ckpt) if rl_ckpt and Path(rl_ckpt).exists() else None
+    residual_model = None
+    if residual_ckpt and Path(residual_ckpt).exists():
+        residual_model = load_residual_policy(
+            residual_ckpt,
+            top_k=args.residual_top_k,
+            allow_fallback=not args.residual_no_fallback,
+            teacher_bias=args.residual_teacher_bias,
+        )
+    elif args.residual_checkpoint:
+        print(
+            f"[warn] residual checkpoint missing at {args.residual_checkpoint}, skipping residual_topk."
+        )
 
     records: list[dict[str, object]] = []
     for circuit in circuits:
@@ -538,6 +606,7 @@ def main(argv: list[str] | None = None) -> int:
                                 teacher_mix=args.il_teacher_mix,
                                 teacher_swaps=teacher_swaps,
                                 swap_guard_ratio=args.il_swap_guard,
+                                allow_fallback=not args.il_no_fallback,
                             )
                         except Exception as exc:  # pragma: no cover - defensive
                             print(
@@ -549,6 +618,32 @@ def main(argv: list[str] | None = None) -> int:
                                     circuit,
                                     graph_id,
                                     il_result,
+                                    seed=seed,
+                                    suite=args.suite,
+                                    hardware_seed=hw_seed,
+                                    hardware_profile=args.hardware_profile,
+                                )
+                            )
+                    if residual_model is not None:
+                        try:
+                            residual_result = route_with_residual_policy(
+                                residual_model,
+                                circuit.circuit,
+                                coupling,
+                                name=residual_name,
+                                seed=seed,
+                                hardware_model=hw_model,
+                            )
+                        except Exception as exc:  # pragma: no cover - defensive
+                            print(
+                                f"[warn] Residual policy failed on {circuit.circuit_id} {graph_id}: {exc}"
+                            )
+                        else:
+                            records.append(
+                                _result_record(
+                                    circuit,
+                                    graph_id,
+                                    residual_result,
                                     seed=seed,
                                     suite=args.suite,
                                     hardware_seed=hw_seed,
@@ -567,6 +662,7 @@ def main(argv: list[str] | None = None) -> int:
                                 teacher_mix=args.rl_teacher_mix,
                                 teacher_swaps=teacher_swaps,
                                 swap_guard_ratio=args.rl_swap_guard,
+                                allow_fallback=not args.rl_no_fallback,
                             )
                         except Exception as exc:  # pragma: no cover - defensive
                             print(
@@ -596,7 +692,12 @@ def main(argv: list[str] | None = None) -> int:
 
     summary_name = args.summary_name or args.results_name.replace("results", "summary")
     summary_path = out_dir / summary_name
-    _write_summary(df, summary_path)
+    if args.summary_std_name:
+        summary_std_path = out_dir / args.summary_std_name
+    else:
+        stem, ext = os.path.splitext(summary_name)
+        summary_std_path = out_dir / f"{stem}_std{ext}"
+    _write_summary(df, summary_path, summary_std_path)
 
     metadata_path = out_dir / "metadata.json"
     existing_meta = {}
@@ -614,6 +715,7 @@ def main(argv: list[str] | None = None) -> int:
             "qasm_root": str(qasm_root),
             "results": str(results_path),
             "summary": str(summary_path),
+            "summary_std": str(summary_std_path) if summary_std_path else None,
             "seeds": seeds,
             "circuits_evaluated": len(circuits),
             "coupling_maps": list(coupling_maps.keys()),
@@ -621,10 +723,17 @@ def main(argv: list[str] | None = None) -> int:
             "rl_checkpoint": str(rl_ckpt) if rl_ckpt else None,
             "il_name": il_name if il_model else None,
             "rl_name": rl_name if rl_model else None,
+            "residual_name": residual_name if residual_model else None,
             "il_teacher_mix": args.il_teacher_mix if il_model else None,
             "rl_teacher_mix": args.rl_teacher_mix if rl_model else None,
             "il_swap_guard": args.il_swap_guard if il_model else None,
             "rl_swap_guard": args.rl_swap_guard if rl_model else None,
+            "il_allow_fallback": (not args.il_no_fallback) if il_model else None,
+            "rl_allow_fallback": (not args.rl_no_fallback) if rl_model else None,
+            "residual_allow_fallback": (not args.residual_no_fallback) if residual_model else None,
+            "residual_top_k": args.residual_top_k if residual_model else None,
+            "residual_checkpoint": str(residual_ckpt) if residual_ckpt and residual_model else None,
+            "residual_teacher_bias": args.residual_teacher_bias if residual_model else None,
             "include_teacher": args.include_teacher,
             "hardware_seeds": hardware_seeds,
             "hardware_profile": args.hardware_profile,
@@ -640,6 +749,8 @@ def main(argv: list[str] | None = None) -> int:
     _validate_results(results_path)
     print(f"Wrote {len(df)} rows to {results_path}")
     print(f"Wrote summary to {summary_path}")
+    if summary_std_path:
+        print(f"Wrote summary std to {summary_std_path}")
     print(f"Wrote metadata to {metadata_path}")
     return 0
 

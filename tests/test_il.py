@@ -55,7 +55,16 @@ def test_training_smoke(tmp_path):
     model, history = train_model(samples, epochs=1, lr=1e-2, tau=1.0)
     ckpt_path = tmp_path / "ckpt.pt"
     save_checkpoint(
-        model, ckpt_path, epochs=1, seed=7, loss_history=history, tau=1.0, hard_weight=0.2
+        model,
+        ckpt_path,
+        epochs=1,
+        seed=7,
+        loss_history=history,
+        tau=1.0,
+        hard_weight=0.2,
+        mse_weight=1.0,
+        rank_weight=0.5,
+        score_mode="min",
     )
 
     assert ckpt_path.exists()

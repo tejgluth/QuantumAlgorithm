@@ -24,8 +24,8 @@ from quantum_routing_rl.eval.metrics import assert_coupling_compatible, compute_
 
 from quantum_routing_rl.env.state import RoutingState
 
-CANDIDATE_FEATURE_DIM = 10
-STATE_FEATURE_DIM = 3
+CANDIDATE_FEATURE_DIM = 12
+STATE_FEATURE_DIM = 4
 FEATURE_DIM = CANDIDATE_FEATURE_DIM + STATE_FEATURE_DIM
 DEFAULT_P2_ERROR = 0.005
 DEFAULT_T2_NS = 400.0
@@ -56,6 +56,8 @@ def candidate_features(
         7: congestion proxy (avg degree / max degree)
         8: candidate was used recently (within anti-osc window)
         9: mean recent involvement of the two qubits
+        10: current lookahead total distance (normalised)
+        11: lookahead distance improvement if swap applied
     """
     frontier_pair = _frontier_physical_pair(state)
     if frontier_pair is None:
@@ -81,6 +83,20 @@ def candidate_features(
     recent_swaps = getattr(state, "recent_swaps", [])
     window = max(1, len(recent_swaps)) if recent_swaps else 1
 
+    lookahead_gates = state.lookahead[:4]
+    lookahead_norm = max(1, graph.number_of_nodes())
+
+    def _lookahead_distance(layout: dict[int, int]) -> float:
+        total = 0.0
+        for gate in lookahead_gates:
+            try:
+                total += nx.shortest_path_length(graph, layout[gate[0]], layout[gate[1]])
+            except (KeyError, nx.NetworkXNoPath):
+                total += graph.number_of_nodes()
+        return float(total)
+
+    current_lookahead = _lookahead_distance(state.layout)
+
     for u, v in state.candidate_swaps:
         on_shortest = int(u in path_nodes and v in path_nodes)
         new_layout = _swapped_layout(state.layout, u, v)
@@ -104,6 +120,9 @@ def candidate_features(
         deg_v = graph.degree[v] if v in graph else 0
         congestion = ((deg_u + deg_v) / 2) / max_degree if max_degree else 0.0
 
+        new_lookahead = _lookahead_distance(new_layout)
+        lookahead_improvement = current_lookahead - new_lookahead
+
         edge_props = hardware.get_edge_props(u, v) if hardware else None
         p2_error = edge_props.p2_error if edge_props else DEFAULT_P2_ERROR
         t2_dur_us = (edge_props.t2_duration_ns if edge_props else DEFAULT_T2_NS) / 1000.0
@@ -126,6 +145,8 @@ def candidate_features(
                 float(congestion),
                 float(recent_edge),
                 float(qubit_recency),
+                float(current_lookahead / lookahead_norm),
+                float(lookahead_improvement / lookahead_norm),
             ]
         )
     return torch.tensor(feats, dtype=torch.float32)
@@ -146,7 +167,17 @@ def state_features(state: RoutingState, graph: nx.Graph) -> torch.Tensor:
     )
     step_norm = state.step_count / max(1, len(state.layout) * 4)
     candidate_norm = len(state.candidate_swaps) / max(1, graph.number_of_edges() or 1)
-    return torch.tensor([dist_norm, step_norm, candidate_norm], dtype=torch.float32)
+    lookahead = state.lookahead[:4]
+    lookahead_sum = 0.0
+    for gate in lookahead:
+        try:
+            lookahead_sum += nx.shortest_path_length(
+                graph, state.layout[gate[0]], state.layout[gate[1]]
+            )
+        except (KeyError, nx.NetworkXNoPath):
+            lookahead_sum += graph.number_of_nodes()
+    lookahead_norm = lookahead_sum / max(1, graph.number_of_nodes())
+    return torch.tensor([dist_norm, step_norm, candidate_norm, lookahead_norm], dtype=torch.float32)
 
 
 def model_features(
@@ -198,7 +229,11 @@ class SwapPolicy(nn.Module):
     """Small MLP scoring candidate swaps, optional value head for RL."""
 
     def __init__(
-        self, feature_dim: int = FEATURE_DIM, hidden_dim: int = 128, use_value_head: bool = False
+        self,
+        feature_dim: int = FEATURE_DIM,
+        hidden_dim: int = 128,
+        use_value_head: bool = False,
+        score_mode: str = "max",
     ):
         super().__init__()
         self.net = nn.Sequential(
@@ -217,6 +252,8 @@ class SwapPolicy(nn.Module):
             if use_value_head
             else None
         )
+        # score_mode: "max" treats larger outputs as better; "min" treats smaller as better.
+        self.score_mode = score_mode
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         logits = self.net(features).squeeze(-1)
@@ -240,6 +277,24 @@ def choose_action(logits: torch.Tensor, mask: torch.Tensor | None = None) -> int
     return int(torch.argmax(logits).item())
 
 
+def _score_mode(model: SwapPolicy) -> str:
+    """Return scoring direction for a policy (max or min)."""
+
+    mode = getattr(model, "score_mode", "max")
+    if mode not in {"max", "min"}:
+        return "max"
+    return mode
+
+
+def _scores_to_logits(scores: torch.Tensor, model: SwapPolicy) -> torch.Tensor:
+    """Convert raw scores to logits respecting the policy's score_mode."""
+
+    mode = _score_mode(model)
+    if mode == "min":
+        return -scores
+    return scores
+
+
 def policy_step(
     model: SwapPolicy, state: RoutingState, graph: nx.Graph, hardware: HardwareModel | None = None
 ) -> PolicyOutput:
@@ -247,7 +302,8 @@ def policy_step(
     with torch.no_grad():
         feats = model_features(state, graph, hardware)
         feats = _match_feature_dim(feats, model.net[0].in_features)
-        logits = model(feats)
+        raw_scores = model(feats)
+        logits = _scores_to_logits(raw_scores, model)
         mask_tensor = torch.tensor(state.action_mask, dtype=torch.bool)
         action = choose_action(logits, mask_tensor)
     return PolicyOutput(action_index=action, logits=logits)
@@ -272,8 +328,12 @@ def load_swap_policy(
         checkpoint.get("use_value_head", False)
         or any(key.startswith("value_head") for key in state_dict.keys())
     )
+    score_mode = checkpoint.get("score_mode", "max")
     model = SwapPolicy(
-        feature_dim=feature_dim, hidden_dim=hidden_dim, use_value_head=use_value_head
+        feature_dim=feature_dim,
+        hidden_dim=hidden_dim,
+        use_value_head=use_value_head,
+        score_mode=score_mode,
     )
     model.load_state_dict(state_dict, strict=False)
     model.to(device)
@@ -294,6 +354,7 @@ def route_with_policy(
     teacher_mix: float = 0.0,
     teacher_swaps: float | None = None,
     swap_guard_ratio: float | None = None,
+    allow_fallback: bool = True,
 ) -> BaselineResult:
     """Roll out greedy policy to produce a routed circuit."""
     if env_config is not None:
@@ -301,7 +362,7 @@ def route_with_policy(
     elif swap_guard_ratio is not None or teacher_mix > 0:
         effective_config = RoutingEnvConfig(frontier_size=4)
     else:
-        effective_config = RoutingEnvConfig()
+        effective_config = RoutingEnvConfig(frontier_size=4)
     env = RoutingEnv(effective_config)
     try:
         initial_layout = _sabre_initial_layout(circuit, coupling_map, seed=seed)
@@ -336,9 +397,11 @@ def route_with_policy(
         if teacher_swaps:
             guard_target = float(swap_guard_ratio) * float(teacher_swaps)
     start = time.perf_counter()
-    step_budget = max_steps or max(200, len(circuit.data) * 10)
+    base_budget = max_steps or max(200, len(circuit.data) * 10)
+    policy_budget = base_budget if allow_fallback else base_budget * 2
+    fallback_budget = max(policy_budget, base_budget * 2) if allow_fallback else policy_budget
     steps = 0
-    while not state.done and steps < step_budget:
+    while not state.done and steps < policy_budget:
         use_teacher = bool(
             teacher_guard is not None
             and guard_target is not None
@@ -350,7 +413,8 @@ def route_with_policy(
         else:
             feats = model_features(state, graph, hardware)
             feats = _match_feature_dim(feats, model.net[0].in_features)  # type: ignore[index]
-            logits = model(feats)
+            raw_scores = model(feats)
+            logits = _scores_to_logits(raw_scores, model)
             mask_tensor = torch.tensor(state.action_mask, dtype=torch.bool)
             logits = logits.masked_fill(~mask_tensor, -1e9)
             if teacher_for_mix is not None:
@@ -371,13 +435,14 @@ def route_with_policy(
         steps += 1
 
     # Fallback to a deterministic teacher if the learned policy stalls.
-    while not state.done and steps < step_budget * 2:
-        action = teacher_fallback_action(state, graph, hardware)
-        state, _, _, _ = env.step(action)
-        steps += 1
+    if allow_fallback:
+        while not state.done and steps < fallback_budget:
+            action = teacher_fallback_action(state, graph, hardware)
+            state, _, _, _ = env.step(action)
+            steps += 1
 
     if not state.done:
-        msg = f"Routing did not complete within {step_budget * 2} steps"
+        msg = f"Routing did not complete within {fallback_budget} steps"
         raise RuntimeError(msg)
 
     runtime = time.perf_counter() - start

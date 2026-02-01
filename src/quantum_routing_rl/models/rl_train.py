@@ -29,6 +29,7 @@ from quantum_routing_rl.models.policy import (
     load_swap_policy,
     model_features,
     route_with_policy,
+    _scores_to_logits,
 )
 from quantum_routing_rl.models.teacher import (
     TeacherPolicy,
@@ -118,8 +119,9 @@ def run_episode(
     while not state.done:
         feats = model_features(state, graph, hardware_model).to(device)
         feats = _match_feature_dim(feats, model.net[0].in_features)  # type: ignore[index]
-        logits = model(feats)
+        raw_scores = model(feats)
         action_mask = torch.tensor(state.action_mask, dtype=torch.bool, device=device)
+        logits = _scores_to_logits(raw_scores, model)
         logits = logits.masked_fill(~action_mask, -1e9)
         dist = torch.distributions.Categorical(logits=logits)
         action = dist.sample()
@@ -220,7 +222,8 @@ def _ppo_update(
     for feats, mask, action in zip(
         rollout.features, rollout.action_masks, rollout.actions, strict=False
     ):
-        logits = model(feats)
+        raw_scores = model(feats)
+        logits = _scores_to_logits(raw_scores, model)
         logits = logits.masked_fill(~mask.bool(), -1e9)
         dist = torch.distributions.Categorical(logits=logits)
         new_log_prob_list.append(dist.log_prob(action))
