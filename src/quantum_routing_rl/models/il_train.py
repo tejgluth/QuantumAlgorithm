@@ -323,6 +323,7 @@ def train_model(
     lr: float = 1e-3,
     tau_start: float = 1.0,
     tau_end: float = 0.3,
+    tau: float | None = None,
     top_k: int | None = None,
     patience: int = 5,
     val_split: float = 0.1,
@@ -331,6 +332,9 @@ def train_model(
     max_train_samples: int | None = None,
     hidden_dim: int = 192,
 ) -> tuple[SwapPolicy, list[dict]]:
+    if tau is not None:
+        tau_start = tau_end = tau
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     feature_dim = (
         samples[0].candidate_features.shape[1] + samples[0].state_features.shape[0]
@@ -445,6 +449,12 @@ def train_model(
             {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "tau": tau_value}
         )
 
+        if epoch == 0 or (epoch + 1) % 5 == 0 or epoch == epochs - 1:
+            print(
+                f"[il] epoch {epoch + 1}/{epochs} tau={tau_value:.3f} "
+                f"train={train_loss:.4f} val={val_loss:.4f}"
+            )
+
         if val_loss < best_val:
             best_val = val_loss
             best_state = model.state_dict()
@@ -467,13 +477,17 @@ def save_checkpoint(
     epochs: int,
     seed: int,
     loss_history: list[dict],
-    tau_start: float,
-    tau_end: float,
-    top_k: int | None,
+    tau_start: float = 1.0,
+    tau_end: float = 0.3,
+    tau: float | None = None,
+    top_k: int | None = None,
     hard_weight: float,
     max_train_samples: int | None = None,
     hidden_dim: int = 192,
 ) -> None:
+    if tau is not None:
+        tau_start = tau_end = tau
+
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -535,7 +549,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=192,
         help="Hidden dimension for the IL MLP (default 192 for stronger capacity).",
     )
-    parser.add_argument("--soft-top-k", type=int, default=8, help="Top-k teacher actions to distil.")
+    parser.add_argument(
+        "--soft-top-k", type=int, default=8, help="Top-k teacher actions to distil."
+    )
     parser.add_argument("--patience", type=int, default=12)
     parser.add_argument("--val-split", type=float, default=0.1)
     parser.add_argument(
