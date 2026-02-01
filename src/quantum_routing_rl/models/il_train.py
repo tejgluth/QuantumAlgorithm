@@ -35,7 +35,8 @@ from quantum_routing_rl.models.teacher import TeacherPolicy, TeacherWeights
 from quantum_routing_rl.hardware.model import HardwareModel
 
 
-FEATURE_VERSION = "il_soft_v1"
+FEATURE_VERSION = "il_soft_v2"
+DATASET_VERSION = "il_dataset_iter2"
 
 
 @dataclass(frozen=True)
@@ -320,11 +321,15 @@ def train_model(
     *,
     epochs: int,
     lr: float = 1e-3,
-    tau: float = 1.0,
+    tau_start: float = 1.0,
+    tau_end: float = 0.3,
+    top_k: int | None = None,
     patience: int = 5,
     val_split: float = 0.1,
     seed: int = 0,
     hard_weight: float = 0.2,
+    max_train_samples: int | None = None,
+    hidden_dim: int = 192,
 ) -> tuple[SwapPolicy, list[dict]]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     feature_dim = (
@@ -332,13 +337,22 @@ def train_model(
         if samples
         else None
     )
-    model = SwapPolicy(feature_dim=feature_dim or SwapPolicy().net[0].in_features).to(device)
+    model = SwapPolicy(
+        feature_dim=feature_dim or SwapPolicy().net[0].in_features,
+        hidden_dim=hidden_dim,
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     history: list[dict] = []
 
     rng = random.Random(seed)
     torch.manual_seed(seed)
     hard_wt = max(0.0, min(1.0, hard_weight))
+
+    def _tau_for_epoch(epoch: int) -> float:
+        if epochs <= 1:
+            return tau_end
+        progress = epoch / max(1, epochs - 1)
+        return tau_start + (tau_end - tau_start) * progress
 
     def _assemble_features(sample: TraceSample) -> torch.Tensor:
         cand = sample.candidate_features.to(device)
@@ -351,16 +365,28 @@ def train_model(
         feats = torch.cat([cand, tiled_state], dim=1)
         return _match_feature_dim(feats, model.net[0].in_features)  # type: ignore[index]
 
-    def _soft_targets(sample: TraceSample) -> torch.Tensor:
+    def _soft_targets(sample: TraceSample, tau_value: float) -> torch.Tensor:
         scores = sample.teacher_scores.to(device)
         mask = sample.action_mask.to(device)
-        masked = scores.clone()
-        masked = torch.where(mask, masked, torch.tensor(float("inf"), device=device))
+        masked = scores.masked_fill(~mask, torch.tensor(float("inf"), device=device))
+
+        effective_mask = mask
+        if top_k is not None and top_k > 0 and mask.any():
+            allowed_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+            allowed_scores = masked[mask]
+            k = min(top_k, allowed_scores.numel())
+            # Select k best (lowest) scores.
+            _, top_positions = torch.topk(-allowed_scores, k)
+            keep_idx = allowed_idx[top_positions]
+            keep_mask = torch.zeros_like(mask, dtype=torch.bool, device=device)
+            keep_mask[keep_idx] = True
+            masked = masked.masked_fill(~keep_mask, torch.tensor(float("inf"), device=device))
+            effective_mask = keep_mask
         # Stable softmax over allowed actions.
-        scaled = -masked / max(tau, 1e-6)
+        scaled = -masked / max(tau_value, 1e-6)
         probs = torch.zeros_like(scaled, device=device)
-        if mask.any():
-            probs[mask] = torch.softmax(scaled[mask], dim=-1)
+        if effective_mask.any():
+            probs[effective_mask] = torch.softmax(scaled[effective_mask], dim=-1)
         if float(probs.sum().item()) == 0.0:
             probs = torch.ones_like(probs, device=device) / len(probs)
         return probs
@@ -377,12 +403,16 @@ def train_model(
     for epoch in range(epochs):
         rng.shuffle(train_samples)
         total_loss = 0.0
-        for sample in train_samples:
+        epoch_samples = train_samples
+        if max_train_samples is not None and len(epoch_samples) > max_train_samples:
+            epoch_samples = epoch_samples[:max_train_samples]
+        tau_value = _tau_for_epoch(epoch)
+        for sample in epoch_samples:
             feats = _assemble_features(sample)
             logits = model(feats)
             mask = sample.action_mask.to(device)
             logits = logits.masked_fill(~mask, -1e9)
-            targets = _soft_targets(sample)
+            targets = _soft_targets(sample, tau_value)
             log_probs = torch.log_softmax(logits, dim=-1)
             loss_soft = F.kl_div(log_probs, targets, reduction="batchmean", log_target=False)
             label_tensor = torch.tensor([sample.label], dtype=torch.long, device=device)
@@ -402,7 +432,7 @@ def train_model(
                 logits = model(feats)
                 mask = sample.action_mask.to(device)
                 logits = logits.masked_fill(~mask, -1e9)
-                targets = _soft_targets(sample)
+                targets = _soft_targets(sample, tau_value)
                 log_probs = torch.log_softmax(logits, dim=-1)
                 loss_soft = F.kl_div(log_probs, targets, reduction="batchmean", log_target=False)
                 label_tensor = torch.tensor([sample.label], dtype=torch.long, device=device)
@@ -411,7 +441,9 @@ def train_model(
                 val_total += float(loss.item())
             val_loss = val_total / max(1, len(val_samples))
 
-        history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
+        history.append(
+            {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "tau": tau_value}
+        )
 
         if val_loss < best_val:
             best_val = val_loss
@@ -435,8 +467,12 @@ def save_checkpoint(
     epochs: int,
     seed: int,
     loss_history: list[dict],
-    tau: float,
+    tau_start: float,
+    tau_end: float,
+    top_k: int | None,
     hard_weight: float,
+    max_train_samples: int | None = None,
+    hidden_dim: int = 192,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -447,9 +483,13 @@ def save_checkpoint(
             "seed": seed,
             "loss_history": loss_history,
             "use_value_head": bool(model.value_head is not None),
-            "tau": tau,
+            "tau_start": tau_start,
+            "tau_end": tau_end,
+            "top_k": top_k,
             "hard_weight": hard_weight,
             "feature_version": FEATURE_VERSION,
+            "max_train_samples": max_train_samples,
+            "hidden_dim": hidden_dim,
         },
         path,
     )
@@ -468,17 +508,35 @@ def _update_metadata(out_dir: Path, updates: dict) -> None:
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True, help="Artifacts directory root.")
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=90)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--tau", type=float, default=1.0, help="Softmax temperature.")
+    parser.add_argument(
+        "--tau-start", type=float, default=1.0, help="Softmax temperature at epoch 0."
+    )
+    parser.add_argument(
+        "--tau-end", type=float, default=0.3, help="Softmax temperature at final epoch."
+    )
+    parser.add_argument(
+        "--tau",
+        type=float,
+        default=None,
+        help="Deprecated fixed temperature; overrides tau-start/tau-end when set.",
+    )
     parser.add_argument(
         "--hard-weight",
         type=float,
-        default=0.35,
+        default=0.7,
         help="Weight for hard-label cross-entropy term (0-1).",
     )
-    parser.add_argument("--patience", type=int, default=6)
+    parser.add_argument(
+        "--hidden-dim",
+        type=int,
+        default=192,
+        help="Hidden dimension for the IL MLP (default 192 for stronger capacity).",
+    )
+    parser.add_argument("--soft-top-k", type=int, default=8, help="Top-k teacher actions to distil.")
+    parser.add_argument("--patience", type=int, default=12)
     parser.add_argument("--val-split", type=float, default=0.1)
     parser.add_argument(
         "--graphs",
@@ -489,13 +547,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--num-circuit-seeds",
         type=int,
-        default=50,
+        default=220,
         help="Number of synthetic circuit seeds per graph.",
     )
     parser.add_argument(
         "--num-hardware-seeds",
         type=int,
-        default=10,
+        default=24,
         help="Number of hardware model seeds per graph.",
     )
     parser.add_argument(
@@ -525,6 +583,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Use a smaller dataset/training run for quick iteration.",
     )
+    parser.add_argument(
+        "--max-train-samples",
+        type=int,
+        default=120_000,
+        help="Cap on number of training samples per epoch (after shuffling).",
+    )
     return parser.parse_args(argv)
 
 
@@ -532,6 +596,10 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     out_dir = args.out.expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    tau_start = args.tau if args.tau is not None else args.tau_start
+    tau_end = args.tau if args.tau is not None else args.tau_end
+    top_k = args.soft_top_k if args.soft_top_k and args.soft_top_k > 0 else None
 
     graphs = [g.strip() for g in args.graphs.split(",") if g.strip()]
     if args.fast:
@@ -561,12 +629,15 @@ def main(argv: list[str] | None = None) -> int:
         if not meta:
             return True
         return (
-            meta.get("feature_version") != FEATURE_VERSION
+            meta.get("dataset_version") != DATASET_VERSION
+            or meta.get("feature_version") != FEATURE_VERSION
             or meta.get("graphs") != graphs
             or meta.get("num_circuit_seeds") != len(circuit_seeds)
             or meta.get("num_hardware_seeds") != len(hardware_seeds)
             or meta.get("hardware_profile") != args.hardware_profile
             or meta.get("pressure_seed") != args.pressure_seed
+            or meta.get("circuit_seed_base") != args.circuit_seed_base
+            or meta.get("hardware_seed_base") != args.hardware_seed_base
         )
 
     samples: list[TraceSample]
@@ -588,9 +659,12 @@ def main(argv: list[str] | None = None) -> int:
                 "hardware_seeds": hardware_seeds,
                 "num_circuit_seeds": len(circuit_seeds),
                 "num_hardware_seeds": len(hardware_seeds),
+                "dataset_version": DATASET_VERSION,
                 "teacher_weights": asdict(TeacherWeights()),
                 "seed": args.seed,
                 "hardware_profile": args.hardware_profile,
+                "circuit_seed_base": args.circuit_seed_base,
+                "hardware_seed_base": args.hardware_seed_base,
                 "pressure_seed": args.pressure_seed,
                 "pressure_circuits": [
                     c.circuit_id for c in pressure_suite(seed=args.pressure_seed)
@@ -616,9 +690,12 @@ def main(argv: list[str] | None = None) -> int:
                     "hardware_seeds": hardware_seeds,
                     "num_circuit_seeds": len(circuit_seeds),
                     "num_hardware_seeds": len(hardware_seeds),
+                    "dataset_version": DATASET_VERSION,
                     "teacher_weights": asdict(TeacherWeights()),
                     "seed": args.seed,
                     "hardware_profile": args.hardware_profile,
+                    "circuit_seed_base": args.circuit_seed_base,
+                    "hardware_seed_base": args.hardware_seed_base,
                     "pressure_seed": args.pressure_seed,
                     "pressure_circuits": [
                         c.circuit_id for c in pressure_suite(seed=args.pressure_seed)
@@ -630,11 +707,15 @@ def main(argv: list[str] | None = None) -> int:
         samples,
         epochs=args.epochs,
         lr=args.lr,
-        tau=args.tau,
+        tau_start=tau_start,
+        tau_end=tau_end,
+        top_k=top_k,
         patience=args.patience,
         val_split=args.val_split,
         seed=args.seed,
         hard_weight=args.hard_weight,
+        max_train_samples=args.max_train_samples,
+        hidden_dim=args.hidden_dim,
     )
     ckpt_path = out_dir / "checkpoints" / "il_soft.pt"
     save_checkpoint(
@@ -643,8 +724,12 @@ def main(argv: list[str] | None = None) -> int:
         epochs=args.epochs,
         seed=args.seed,
         loss_history=history,
-        tau=args.tau,
+        tau_start=tau_start,
+        tau_end=tau_end,
+        top_k=top_k,
         hard_weight=args.hard_weight,
+        max_train_samples=args.max_train_samples,
+        hidden_dim=args.hidden_dim,
     )
 
     # Quick smoke rollout on first circuit (if any) to ensure checkpoint usable.
@@ -663,11 +748,17 @@ def main(argv: list[str] | None = None) -> int:
                 "il_seed": args.seed,
                 "il_epochs": args.epochs,
                 "il_lr": args.lr,
-                "il_tau": args.tau,
+                "il_tau": tau_end,
+                "il_tau_start": tau_start,
+                "il_tau_end": tau_end,
+                "il_top_k": top_k,
                 "il_hard_weight": args.hard_weight,
                 "il_graphs": graphs,
                 "il_circuit_seeds": circuit_seeds,
                 "il_hardware_seeds": hardware_seeds,
+                "il_max_train_samples": args.max_train_samples,
+                "il_hidden_dim": args.hidden_dim,
+                "il_dataset_version": DATASET_VERSION,
                 "il_feature_version": FEATURE_VERSION,
                 "il_history_path": str(out_dir / "training" / "il_soft.json"),
             },

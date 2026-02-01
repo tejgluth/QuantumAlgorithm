@@ -259,20 +259,23 @@ def load_swap_policy(
     """Load checkpoint saved by imitation learning or RL."""
     device = device or torch.device("cpu")
     checkpoint = torch.load(path, map_location=device)
-    feature_dim = int(checkpoint.get("feature_dim", FEATURE_DIM))
     state_dict_key = "model_state"
     if state_dict_key not in checkpoint:
         state_dict_key = "model_state_dict"
     state_dict = checkpoint[state_dict_key]
+    feature_dim = int(checkpoint.get("feature_dim", FEATURE_DIM))
+    hidden_dim = int(checkpoint.get("hidden_dim", 0))
+    if not hidden_dim:
+        weight = state_dict.get("net.0.weight")
+        hidden_dim = int(weight.shape[0]) if weight is not None else 128
     use_value_head = bool(
         checkpoint.get("use_value_head", False)
         or any(key.startswith("value_head") for key in state_dict.keys())
     )
-    model = SwapPolicy(feature_dim=feature_dim, use_value_head=use_value_head)
-    state_dict_key = "model_state"
-    if state_dict_key not in checkpoint:
-        state_dict_key = "model_state_dict"
-    model.load_state_dict(checkpoint[state_dict_key], strict=False)
+    model = SwapPolicy(
+        feature_dim=feature_dim, hidden_dim=hidden_dim, use_value_head=use_value_head
+    )
+    model.load_state_dict(state_dict, strict=False)
     model.to(device)
     model.eval()
     return model
