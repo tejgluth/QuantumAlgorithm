@@ -1,27 +1,43 @@
-# Phase 3: Multi-step Residual Search
+# Phase 4: Weighted SABRE Validation (Noise + Drift)
 
-Experiments:
-- Horizon 2 (top_k=4, branch_k=2, swap_penalty=0.15, duration_scale=5e-4, progress_weight=0.1). Command: `python3 -m quantum_routing_rl.eval.run_eval --suite pressure --out artifacts ... --residual-multistep --residual-horizon 2`. Summary: `artifacts/summary_noise_unguarded.csv`. Outcomes: overall_log_success_mean for residual_multistep = -0.506 (qiskit_sabre_best = -0.332); swap ratios vs sabre by graph — grid_3x3: 2.36x, heavy_hex_15: 3.57x, ring_8: 5.72x; 701/720 rows flagged for constraint_violation (>1.3x swaps/depth/duration).
-- Horizon 3 (same config, `artifacts/summary_noise_unguarded_h3.csv`). Outcomes: overall_log_success_mean = -0.426 (still below sabre); swap ratios — grid_3x3: 2.10x, heavy_hex_15: 2.48x, ring_8: 2.90x; 698/720 rows violate the 1.3x constraints.
+## Problem
+Quantify whether WeightedSABRE improves predicted execution success under realistic, drift-aware hardware models without exceeding the constraint budget (swaps/twoq_depth/total_duration ≤ 1.3× `qiskit_sabre_best`).
 
-Conclusion: Single- and multi-step residual search with learned costs does not outperform SABRE under realistic constraints on these benchmarks.
+## Experimental Setup
+- Benchmarks: pressure suite on `ring_8`, `grid_3x3`, `heavy_hex_15` (9 circuits).
+- Seeds: 13, 17, 23. Hardware draws per seed: **50**; directional errors, crosstalk=0.01, drift rate=0.05, two snapshots spaced 50 µs.
+- Config: `alpha=0.5`, `beta=0.2`, `snapshot_mode=avg`, `trials=8`, frontier=4. Command: `SKIP_RL=1 make eval-noise-unguarded-weighted HARDWARE_DRAWS=50`.
+- Key artifacts: `artifacts/results_noise_unguarded_weighted_hd.csv`, `summary_noise_unguarded_weighted_hd.csv`, `summary_noise_unguarded_weighted_hd_std.csv`, plots in `artifacts/plots_noise_unguarded_weighted/`, metadata in `artifacts/metadata.json`.
 
-## Phase 4: Weighted / Noise-Aware SABRE
+## Main Results (95% CI of mean overall_log_success)
+| graph | qiskit_sabre_best | weighted_sabre | swap ratio | depth ratio | duration ratio |
+| --- | --- | --- | --- | --- | --- |
+| grid_3x3 | −0.295 ± 0.020 | **−0.254 ± 0.019** | 1.17 | 1.01 | 0.92 |
+| heavy_hex_15 | −0.421 ± 0.026 | **−0.398 ± 0.028** | 1.14 | 0.97 | 0.91 |
+| ring_8 | −0.266 ± 0.026 | **−0.235 ± 0.025** | 1.10 | 0.99 | 0.96 |
 
-Implementation highlights:
-- Weighted distance cache (`weighted_distance.py`) combines calibrated error, duration/T2, and crosstalk with a stability floor; router runs 8 stochastic trials with SabreLayout-derived seeds and picks the best (overall_log_success, then swaps, depth with a small tie tolerance).
-- Router scoring/decay mirrors the teacher and keeps the tightened SABRE candidate set; snapshot handling averages the first two drift snapshots.
+All overhead ratios remain <1.2×, comfortably inside the 1.3× constraint ceiling.
 
-Validation sweep (pressure subset, `pressure_qasm=3`, `hardware_samples=2`, seed=13):
-- Grid over alpha_time {0.0, 0.2, 0.5, 1.0} × beta_xtalk {0.0, 0.2, 0.5} × snapshot_mode {avg, bucket} × trials {4, 8}.
-- All passing configs and scores recorded in `artifacts/sweep/sweep_configs.json`; performance clustered, so we carried forward three representatives: (0, 0, avg, 8), (0, 0.2, bucket, 8), and the noise-aware (0.5, 0.2, avg, 8).
+## Paired Delta Analysis
+- Dataset: 3,600 paired draws (circuit, graph, seed, hardware_seed) saved in `artifacts/deltas/paired_deltas.csv`.
+- Mean delta_success = **+0.0311** with 95% bootstrap CI [0.0283, 0.0340]; **84.6%** of pairs favor WeightedSABRE (`artifacts/deltas/paired_delta_summary.csv`, plots in `artifacts/plots_paired_deltas/`).
+- Per-graph positive fractions: grid_3x3 91.1%, heavy_hex_15 78.2%, ring_8 85.4%.
 
-Full noise-aware evaluation (pressure suite, seeds 13/17/23, 10 hardware draws with drift, directional errors, crosstalk):
-- Files: `artifacts/results_noise_unguarded_weighted*.csv`, `summary_noise_unguarded_weighted*.csv`, `summary_noise_unguarded_weighted*.csv`, plots in `artifacts/plots_noise_unguarded_weighted/weighted_vs_qiskit_overall_success.{png,pdf}`.
-- Representative config (alpha_time=0.5, beta_xtalk=0.2, snapshot_mode=avg, trials=8, frontier_size=4) beats the qiskit_sabre_best reference on overall_log_success while staying within 1.3× on swaps/twoq_depth/total_duration for every pressure graph:
-  - grid_3x3: overall_log_success_mean −0.249 ± 0.335 vs qiskit −0.301; swap ratio 1.18×; depth ratio 1.01×; duration ratio 0.93×.
-  - heavy_hex_15: overall_log_success_mean −0.390 ± 0.505 vs qiskit −0.410; swap ratio 1.17×; depth ratio 0.96×; duration ratio 0.90×.
-  - ring_8: overall_log_success_mean −0.264 ± 0.483 vs qiskit −0.286; swap ratio 1.12×; depth ratio 0.99×; duration ratio 0.95×.
-- The other two swept configs matched these metrics (within rounding), indicating robustness to small changes in alpha/beta/snapshot_mode under the current distance floor.
+## Variance Attribution (centered per circuit)
+- Hardware heterogeneity explains ~30% of variance in overall_log_success; seed-to-seed randomness explains <1% on average; the remainder is circuit-specific/residual (`artifacts/variance/variance_breakdown.csv`, plots in `artifacts/variance/`).
+- Example (weighted_sabre): grid_3x3 hardware 33%, seed 0.6%, residual 67%.
 
-Bottom line: the WeightedSABRE variant delivers higher noise-aware success than qiskit_sabre_best on all pressure graphs while honoring the ≤1.3× swap/depth/duration constraint.
+## Ablation Study (30 hardware draws, trials=8, snapshot_mode=avg)
+- Configs: A0 (α=0, β=0), A1 (α>0, β=0), A2 (α=0, β>0), A3 (α>0, β>0).
+- Outcomes (`artifacts/summary_ablation.csv`, `artifacts/plots_ablation/`): all four ablations produce nearly identical success (grid −0.259, heavy_hex −0.389, ring −0.253) and overhead (swap ratios 1.09–1.17, duration ratios 0.89–0.96). The gain therefore stems mainly from layout jitter + multi-trial search, not from the specific α/β weights.
+
+## Yield vs Routing Overhead
+- Scatter (`artifacts/plots_yield_overhead/yield_vs_overhead.png`): WeightedSABRE points sit at swap ratios 1.10–1.17 with higher success (≈+0.03) than the qiskit baseline at ratio 1.0 (`yield_vs_overhead_points.csv`).
+
+## Limitations
+- Residual variance is large (circuit difficulty dominates); hardware models are synthetic with assumed drift/crosstalk parameters.
+- Ablation insensitivity suggests the current α/β weighting has limited leverage; benefits may mainly come from stochastic restarts rather than noise-aware distance terms.
+- Only pressure-suite graphs and three seeds were tested; no cross-validation on larger layouts or real calibration data.
+
+## Takeaway for Compiler Developers
+WeightedSABRE (α=0.5, β=0.2, trials=8) delivers a small but statistically robust improvement in predicted execution success under drift-aware noise models, while keeping swap/depth/duration overhead below 1.2× relative to `qiskit_sabre_best`. For hardware with noticeable drift or directional errors, enabling this routing variant is a low-risk knob: expect ~3e−2 uplift in log-success in ~85% of cases with minor swap inflation and shorter predicted duration.

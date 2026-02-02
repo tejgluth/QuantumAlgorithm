@@ -1024,6 +1024,7 @@ def main(argv: list[str] | None = None) -> int:
             "hardware_snapshot_spacing": args.hardware_snapshot_spacing,
             "hardware_directional": args.hardware_directional,
             "hardware_crosstalk": args.hardware_crosstalk,
+            "hardware_draws": max(1, args.hardware_samples),
         }
     )
     metadata_path.write_text(json.dumps(metadata, indent=2))
