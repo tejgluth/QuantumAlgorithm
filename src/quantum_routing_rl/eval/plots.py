@@ -152,6 +152,48 @@ def _pareto_overall_success(df: pd.DataFrame, out_dir: Path) -> None:
     plt.close(fig)
 
 
+def _weighted_vs_qiskit(df: pd.DataFrame, out_dir: Path) -> None:
+    baselines = {"weighted_sabre", "qiskit_sabre_best"}
+    if "baseline_name" not in df.columns or not baselines.issubset(set(df["baseline_name"])):
+        return
+    subset = df[
+        (df["baseline_name"].isin(baselines)) & df["overall_log_success"].notna()  # type: ignore[operator]
+    ]
+    if subset.empty:
+        return
+    agg = (
+        subset.groupby(["graph_id", "baseline_name"])
+        .agg({"swaps_inserted": "mean", "overall_log_success": "mean"})
+        .reset_index()
+    )
+    palette = {"weighted_sabre": "tab:blue", "qiskit_sabre_best": "tab:orange"}
+    markers = {"weighted_sabre": "o", "qiskit_sabre_best": "s"}
+    fig, ax = plt.subplots(figsize=(6, 5))
+    for baseline, group in agg.groupby("baseline_name"):
+        ax.scatter(
+            group["swaps_inserted"],
+            group["overall_log_success"],
+            label=baseline,
+            color=palette.get(baseline, "gray"),
+            marker=markers.get(baseline, "o"),
+            s=70,
+        )
+        for _, row in group.iterrows():
+            ax.annotate(
+                row["graph_id"],
+                (row["swaps_inserted"], row["overall_log_success"]),
+                fontsize=8,
+            )
+    ax.set_xlabel("Swaps (mean)")
+    ax.set_ylabel("Overall log success (mean)")
+    ax.legend()
+    fig.tight_layout()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for ext in ("png", "pdf"):
+        fig.savefig(out_dir / f"weighted_vs_qiskit_overall_success.{ext}", dpi=200)
+    plt.close(fig)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     df = pd.read_csv(args.input)
@@ -213,6 +255,7 @@ def main(argv: list[str] | None = None) -> int:
     _pareto(df, out_dir)
     _pareto_noise(df, out_dir)
     _pareto_overall_success(df, out_dir)
+    _weighted_vs_qiskit(df, out_dir)
     return 0
 
 

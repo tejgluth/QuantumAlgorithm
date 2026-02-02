@@ -33,6 +33,12 @@ from quantum_routing_rl.models.multistep_residual import (
     route_with_multistep_residual,
 )
 from quantum_routing_rl.models.teacher import route_with_teacher
+from quantum_routing_rl.models.weighted_sabre import (
+    WeightedDistanceParams,
+    WeightedSabreWeights,
+    route_with_weighted_sabre,
+)
+from quantum_routing_rl.env.routing_env import RoutingEnvConfig
 from quantum_routing_rl.hardware.model import HardwareModel
 
 REQUIRED_COLUMNS = {
@@ -62,8 +68,14 @@ def _violates_constraint(candidate, reference, ratio: float = 1.3) -> bool:
     if reference is None:
         return False
     try:
-        swaps_ok = reference.metrics.swaps > 0 and candidate.metrics.swaps <= ratio * reference.metrics.swaps
-        twoq_ok = reference.metrics.two_qubit_depth > 0 and candidate.metrics.two_qubit_depth <= ratio * reference.metrics.two_qubit_depth
+        swaps_ok = (
+            reference.metrics.swaps > 0
+            and candidate.metrics.swaps <= ratio * reference.metrics.swaps
+        )
+        twoq_ok = (
+            reference.metrics.two_qubit_depth > 0
+            and candidate.metrics.two_qubit_depth <= ratio * reference.metrics.two_qubit_depth
+        )
         duration_ref = reference.metrics.total_duration_ns
         duration_ok = (
             duration_ref is None
@@ -236,6 +248,71 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--include-teacher",
         action="store_true",
         help="Evaluate the in-env teacher policy alongside baselines.",
+    )
+    parser.add_argument(
+        "--run-weighted-sabre",
+        action="store_true",
+        help="Evaluate the weighted SABRE router using hardware-aware distances.",
+    )
+    parser.add_argument(
+        "--weighted-alpha-time",
+        type=float,
+        default=0.0,
+        help="Weight on duration/T2 term in weighted distance.",
+    )
+    parser.add_argument(
+        "--weighted-beta-xtalk",
+        type=float,
+        default=0.0,
+        help="Weight on crosstalk term in weighted distance.",
+    )
+    parser.add_argument(
+        "--weighted-min-edge",
+        type=float,
+        default=1.0,
+        help="Minimum per-edge weight floor applied to weighted distances.",
+    )
+    parser.add_argument(
+        "--weighted-snapshot-mode",
+        choices=["avg", "bucket"],
+        default="avg",
+        help="Use snapshot averaging or bucketed index for weighted distances.",
+    )
+    parser.add_argument(
+        "--weighted-trials",
+        type=int,
+        default=8,
+        help="Number of weighted SABRE trials (different seeds/layout jitters).",
+    )
+    parser.add_argument(
+        "--weighted-frontier-size",
+        type=int,
+        default=4,
+        help="Frontier size passed to the weighted SABRE environment.",
+    )
+    parser.add_argument(
+        "--weighted-lookahead-weight",
+        type=float,
+        default=0.5,
+        help="Weight on lookahead distance in weighted SABRE scoring.",
+    )
+    parser.add_argument(
+        "--weighted-decay-weight",
+        type=float,
+        default=0.25,
+        help="Tabu/decay penalty weight in weighted SABRE scoring.",
+    )
+    parser.add_argument(
+        "--weighted-stagnation-weight",
+        type=float,
+        default=0.25,
+        help="Penalty applied when frontier distance fails to improve.",
+    )
+    parser.add_argument(
+        "--weighted-decay-factor",
+        type=float,
+        default=0.9,
+        help="Per-step decay factor for tabu penalties.",
     )
     parser.add_argument(
         "--hardware-samples",
@@ -573,6 +650,19 @@ def main(argv: list[str] | None = None) -> int:
         directional=args.hardware_directional,
         crosstalk_factor=max(0.0, args.hardware_crosstalk),
     )
+    weighted_params = WeightedDistanceParams(
+        alpha_time=args.weighted_alpha_time,
+        beta_xtalk=args.weighted_beta_xtalk,
+        min_edge_weight=max(0.0, args.weighted_min_edge),
+    )
+    weighted_trials = max(1, int(args.weighted_trials))
+    weighted_env_cfg = RoutingEnvConfig(frontier_size=max(1, args.weighted_frontier_size))
+    weighted_weights = WeightedSabreWeights(
+        lookahead_weight=args.weighted_lookahead_weight,
+        decay_weight=args.weighted_decay_weight,
+        stagnation_weight=args.weighted_stagnation_weight,
+        decay_factor=args.weighted_decay_factor,
+    )
 
     il_ckpt = args.il_checkpoint or _default_checkpoint(out_dir, ["il_soft", "il"])
     rl_ckpt = args.rl_checkpoint or _default_checkpoint(out_dir, ["rl_ppo", "rl"])
@@ -681,6 +771,40 @@ def main(argv: list[str] | None = None) -> int:
                                 hardware_profile=args.hardware_profile,
                             )
                         )
+                    if args.run_weighted_sabre:
+                        if hw_model is None:
+                            print(
+                                f"[warn] weighted_sabre requires hardware model for {graph_id}; skipping."
+                            )
+                        else:
+                            try:
+                                weighted_result = route_with_weighted_sabre(
+                                    circuit.circuit,
+                                    coupling,
+                                    hardware_model=hw_model,
+                                    seed=seed,
+                                    trials=weighted_trials,
+                                    distance_params=weighted_params,
+                                    snapshot_mode=args.weighted_snapshot_mode,
+                                    router_weights=weighted_weights,
+                                    env_config=weighted_env_cfg,
+                                )
+                            except Exception as exc:  # pragma: no cover - defensive
+                                print(
+                                    f"[warn] weighted_sabre failed on {circuit.circuit_id} {graph_id}: {exc}"
+                                )
+                            else:
+                                records.append(
+                                    _result_record(
+                                        circuit,
+                                        graph_id,
+                                        weighted_result,
+                                        seed=seed,
+                                        suite=args.suite,
+                                        hardware_seed=hw_seed,
+                                        hardware_profile=args.hardware_profile,
+                                    )
+                                )
                     if il_model is not None:
                         try:
                             il_result = route_with_policy(
@@ -854,7 +978,9 @@ def main(argv: list[str] | None = None) -> int:
             if residual_model and not args.residual_multistep
             else None,
             "residual_multistep": args.residual_multistep if residual_model else None,
-            "residual_horizon": args.residual_horizon if residual_model and args.residual_multistep else None,
+            "residual_horizon": args.residual_horizon
+            if residual_model and args.residual_multistep
+            else None,
             "residual_branch_k": args.residual_branch_k
             if residual_model and args.residual_multistep
             else None,
@@ -868,6 +994,29 @@ def main(argv: list[str] | None = None) -> int:
             if residual_model and args.residual_multistep
             else None,
             "include_teacher": args.include_teacher,
+            "run_weighted_sabre": args.run_weighted_sabre,
+            "weighted_alpha_time": args.weighted_alpha_time if args.run_weighted_sabre else None,
+            "weighted_beta_xtalk": args.weighted_beta_xtalk if args.run_weighted_sabre else None,
+            "weighted_snapshot_mode": args.weighted_snapshot_mode
+            if args.run_weighted_sabre
+            else None,
+            "weighted_trials": weighted_trials if args.run_weighted_sabre else None,
+            "weighted_min_edge": args.weighted_min_edge if args.run_weighted_sabre else None,
+            "weighted_frontier_size": args.weighted_frontier_size
+            if args.run_weighted_sabre
+            else None,
+            "weighted_lookahead_weight": args.weighted_lookahead_weight
+            if args.run_weighted_sabre
+            else None,
+            "weighted_decay_weight": args.weighted_decay_weight
+            if args.run_weighted_sabre
+            else None,
+            "weighted_stagnation_weight": args.weighted_stagnation_weight
+            if args.run_weighted_sabre
+            else None,
+            "weighted_decay_factor": args.weighted_decay_factor
+            if args.run_weighted_sabre
+            else None,
             "hardware_seeds": hardware_seeds,
             "hardware_profile": args.hardware_profile,
             "hardware_snapshots": args.hardware_snapshots,

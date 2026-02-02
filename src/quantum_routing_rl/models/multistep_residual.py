@@ -78,7 +78,9 @@ class StateValueNet(torch.nn.Module):
         return self.net(context).squeeze(-1)
 
 
-def load_state_value_model(path: str | "os.PathLike[str]", device: torch.device | None = None) -> StateValueNet:
+def load_state_value_model(
+    path: str | "os.PathLike[str]", device: torch.device | None = None
+) -> StateValueNet:
     payload = torch.load(path, map_location=device or "cpu")
     input_dim = int(payload.get("input_dim", 32))
     hidden = int(payload.get("hidden_dim", 128))
@@ -158,7 +160,9 @@ class MultiStepResidualPolicy:
         teacher_choice = int(torch.argmin(teacher_scores).item()) if teacher_scores.numel() else 0
         top_indices = _topk_indices(teacher_scores, mask, self.config.top_k)
         if not top_indices:
-            return MultiStepDecision(action_index=int(torch.argmin(teacher_scores).item()), utilities={}, expanded=[])
+            return MultiStepDecision(
+                action_index=int(torch.argmin(teacher_scores).item()), utilities={}, expanded=[]
+            )
 
         utilities: dict[int, float] = {}
         best_idx = top_indices[0]
@@ -326,7 +330,9 @@ class MultiStepResidualPolicy:
         if state.done:
             return 0.0
 
-        context = _candidate_context(state, graph, hardware, include_hardware=self.config.include_hardware)
+        context = _candidate_context(
+            state, graph, hardware, include_hardware=self.config.include_hardware
+        )
         if self.value_model is not None:
             with torch.no_grad():
                 ctx = context
@@ -440,6 +446,8 @@ __all__ = [
     "load_state_value_model",
     "load_residual_scorer",
 ]
+
+
 def _frontier_distance(state: RoutingState, graph: nx.Graph) -> float:
     if not state.frontier:
         return 0.0
