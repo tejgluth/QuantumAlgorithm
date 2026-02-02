@@ -9,6 +9,7 @@ from typing import Iterable
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 
 def compute_paired_deltas(
@@ -88,6 +89,33 @@ def bootstrap_ci(
     return lower, upper
 
 
+def _cliffs_delta(values: Iterable[float]) -> float:
+    """Return Cliff's delta effect size for paired deltas."""
+
+    vals = np.asarray(list(values), dtype=float)
+    if vals.size == 0:
+        msg = "cliffs_delta received no data"
+        raise ValueError(msg)
+
+    pos = np.sum(vals > 0)
+    neg = np.sum(vals < 0)
+    total = vals.size
+    return float((pos - neg) / total)
+
+
+def _cohens_d(values: Iterable[float]) -> float:
+    """Return Cohen's d for paired deltas."""
+
+    vals = np.asarray(list(values), dtype=float)
+    if vals.size == 0:
+        msg = "cohens_d received no data"
+        raise ValueError(msg)
+    std = np.std(vals, ddof=1)
+    if std == 0:
+        return float("nan")
+    return float(np.mean(vals) / std)
+
+
 def _summaries(deltas: pd.DataFrame, *, n_resamples: int, seed: int) -> pd.DataFrame:
     rows: list[dict[str, float | str | int]] = []
     for graph_id, sub in [("all", deltas)] + list(deltas.groupby("graph_id")):
@@ -108,7 +136,62 @@ def _summaries(deltas: pd.DataFrame, *, n_resamples: int, seed: int) -> pd.DataF
     return pd.DataFrame(rows)
 
 
-def _plot_histograms(deltas: pd.DataFrame, out_dir: Path) -> None:
+def _stats_tables(
+    deltas: pd.DataFrame, *, n_resamples: int, seed: int
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (significance_df, effect_df)."""
+
+    sig_rows: list[dict[str, float | int | str]] = []
+    eff_rows: list[dict[str, float | int | str]] = []
+    groups = [("all", deltas)] + list(deltas.groupby("graph_id"))
+    for graph_id, sub in groups:
+        vals = sub["delta_success"].to_numpy(dtype=float)
+        if vals.size == 0:
+            continue
+        mean_delta = float(np.mean(vals))
+        ci_lower, ci_upper = bootstrap_ci(vals, n_resamples=n_resamples, seed=seed)
+        try:
+            stat, p_value = stats.wilcoxon(
+                vals,
+                zero_method="pratt",
+                alternative="greater",
+                method="approx",
+            )
+        except Exception:
+            # Fallback to exact when approximation is unsupported for tiny samples.
+            stat, p_value = stats.wilcoxon(
+                vals,
+                zero_method="pratt",
+                alternative="greater",
+                method="exact",
+            )
+        sig_rows.append(
+            {
+                "graph_id": graph_id,
+                "pairs": int(len(vals)),
+                "mean_delta": mean_delta,
+                "ci_lower": ci_lower,
+                "ci_upper": ci_upper,
+                "wilcoxon_stat": float(stat),
+                "p_value": float(p_value),
+                "positive_frac": float((vals > 0).mean()),
+            }
+        )
+
+        eff_rows.append(
+            {
+                "graph_id": graph_id,
+                "pairs": int(len(vals)),
+                "cliffs_delta": _cliffs_delta(vals),
+                "cohens_d": _cohens_d(vals),
+            }
+        )
+    return pd.DataFrame(sig_rows), pd.DataFrame(eff_rows)
+
+
+def _plot_histograms(
+    deltas: pd.DataFrame, out_dir: Path, stats_df: pd.DataFrame | None = None
+) -> None:
     graphs = sorted(deltas["graph_id"].unique())
     cols = max(1, min(3, len(graphs)))
     rows = int(np.ceil(len(graphs) / cols))
@@ -118,14 +201,36 @@ def _plot_histograms(deltas: pd.DataFrame, out_dir: Path) -> None:
     for ax, graph in zip(axes.ravel(), graphs):
         ax.axis("on")
         vals = deltas.loc[deltas["graph_id"] == graph, "delta_success"]
-        ax.hist(vals, bins=20, color="#2f4b7c", alpha=0.85)
+        ax.hist(vals, bins=20, color="#2f4b7c", alpha=0.85, edgecolor="white")
         ax.axvline(0, color="black", linestyle="--", linewidth=1)
-        ax.set_title(f"{graph}")
-        ax.set_xlabel("Delta overall_log_success")
+        ax.set_title(f"{graph} paired deltas")
+        ax.set_xlabel("Δ overall_log_success (weighted - qiskit)")
         ax.set_ylabel("Count")
+        if stats_df is not None:
+            row = stats_df[stats_df["graph_id"] == graph]
+            if not row.empty:
+                mean_delta = row["mean_delta"].iloc[0]
+                ci_lower = row["ci_lower"].iloc[0]
+                ci_upper = row["ci_upper"].iloc[0]
+                p_val = row["p_value"].iloc[0]
+                text = (
+                    f"mean={mean_delta:+.3f}\n"
+                    f"95% CI [{ci_lower:+.3f}, {ci_upper:+.3f}]\n"
+                    f"p={p_val:.2e}"
+                )
+                ax.text(
+                    0.97,
+                    0.97,
+                    text,
+                    transform=ax.transAxes,
+                    ha="right",
+                    va="top",
+                    fontsize=9,
+                    bbox=dict(facecolor="white", alpha=0.8, edgecolor="none"),
+                )
     fig.tight_layout()
     out_dir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_dir / "hist_delta_success.png", dpi=200)
+    fig.savefig(out_dir / "hist_delta_success.png", dpi=300)
     fig.savefig(out_dir / "hist_delta_success.pdf")
     plt.close(fig)
 
@@ -136,12 +241,12 @@ def _plot_cdf(deltas: pd.DataFrame, out_dir: Path) -> None:
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.step(vals, y, where="post", color="#277da1")
     ax.axvline(0, color="black", linestyle="--", linewidth=1)
-    ax.set_xlabel("Delta overall_log_success")
+    ax.set_xlabel("Δ overall_log_success (weighted - qiskit)")
     ax.set_ylabel("CDF")
-    ax.set_title("CDF of paired deltas")
+    ax.set_title("CDF of paired deltas (all graphs)")
     fig.tight_layout()
     out_dir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_dir / "cdf_delta_success.png", dpi=200)
+    fig.savefig(out_dir / "cdf_delta_success.png", dpi=300)
     fig.savefig(out_dir / "cdf_delta_success.pdf")
     plt.close(fig)
 
@@ -154,11 +259,11 @@ def _plot_positive_fraction(deltas: pd.DataFrame, out_dir: Path) -> None:
     ax.bar(fractions["graph_id"], fractions["delta_success"], color="#90be6d")
     ax.set_ylim(0, 1)
     ax.axhline(0.5, color="black", linestyle="--", linewidth=1)
-    ax.set_ylabel("Fraction delta_success > 0")
-    ax.set_title("Positive deltas by graph")
+    ax.set_ylabel("Fraction Δ success > 0")
+    ax.set_title("Fraction of paired draws where Weighted > Qiskit")
     fig.tight_layout()
     out_dir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_dir / "positive_fraction.png", dpi=200)
+    fig.savefig(out_dir / "positive_fraction.png", dpi=300)
     fig.savefig(out_dir / "positive_fraction.pdf")
     plt.close(fig)
 
@@ -189,6 +294,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Number of bootstrap resamples for CIs.",
     )
     parser.add_argument("--seed", type=int, default=1234, help="Bootstrap RNG seed.")
+    parser.add_argument(
+        "--stats-out",
+        type=Path,
+        default=Path("artifacts/statistics"),
+        help="Directory for significance/effect-size CSVs.",
+    )
     args = parser.parse_args(argv)
 
     df = pd.read_csv(args.results)
@@ -204,7 +315,12 @@ def main(argv: list[str] | None = None) -> int:
     summary_df = _summaries(deltas, n_resamples=args.bootstrap_samples, seed=args.seed)
     summary_df.to_csv(args.out / "paired_delta_summary.csv", index=False)
 
-    _plot_histograms(deltas, args.plots_out)
+    sig_df, eff_df = _stats_tables(deltas, n_resamples=args.bootstrap_samples, seed=args.seed)
+    args.stats_out.mkdir(parents=True, exist_ok=True)
+    sig_df.to_csv(args.stats_out / "significance.csv", index=False)
+    eff_df.to_csv(args.stats_out / "effect_size.csv", index=False)
+
+    _plot_histograms(deltas, args.plots_out, stats_df=sig_df)
     _plot_cdf(deltas, args.plots_out)
     _plot_positive_fraction(deltas, args.plots_out)
     return 0

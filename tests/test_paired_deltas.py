@@ -1,7 +1,11 @@
 import numpy as np
 import pandas as pd
 
-from quantum_routing_rl.eval.paired_deltas import bootstrap_ci, compute_paired_deltas
+from quantum_routing_rl.eval.paired_deltas import (
+    bootstrap_ci,
+    compute_paired_deltas,
+    _stats_tables,
+)
 
 
 def test_compute_paired_deltas_basic():
@@ -51,3 +55,17 @@ def test_bootstrap_ci_is_deterministic():
     ci1 = bootstrap_ci(vals, n_resamples=500, seed=42)
     ci2 = bootstrap_ci(vals, n_resamples=500, seed=42)
     assert np.allclose(ci1, ci2)
+
+
+def test_stats_tables_compute_effect_and_significance():
+    rows = []
+    for delta in [0.2, 0.3, -0.1, 0.0]:
+        rows.append({"graph_id": "g", "delta_success": delta})
+    deltas = pd.DataFrame(rows)
+    sig_df, eff_df = _stats_tables(deltas, n_resamples=200, seed=1)
+    assert sig_df.iloc[0]["graph_id"] == "all"
+    assert eff_df.iloc[0]["graph_id"] == "all"
+    assert sig_df.iloc[0]["pairs"] == 4
+    assert eff_df.iloc[0]["pairs"] == 4
+    # Positive deltas dominate so effect sizes should be positive.
+    assert eff_df.iloc[0]["cliffs_delta"] > 0
