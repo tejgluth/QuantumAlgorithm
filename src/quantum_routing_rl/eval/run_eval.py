@@ -26,6 +26,12 @@ from quantum_routing_rl.models.residual_policy import (
     load_residual_policy,
     route_with_residual_policy,
 )
+from quantum_routing_rl.models.multistep_residual import (
+    MultiStepConfig,
+    MultiStepResidualPolicy,
+    load_residual_scorer,
+    route_with_multistep_residual,
+)
 from quantum_routing_rl.models.teacher import route_with_teacher
 from quantum_routing_rl.hardware.model import HardwareModel
 
@@ -48,6 +54,26 @@ REQUIRED_COLUMNS = {
     "hardware_seed",
     "qiskit_version",
 }
+
+
+def _violates_constraint(candidate, reference, ratio: float = 1.3) -> bool:
+    """Return True if any constraint exceeds ratio vs reference metrics."""
+
+    if reference is None:
+        return False
+    try:
+        swaps_ok = reference.metrics.swaps > 0 and candidate.metrics.swaps <= ratio * reference.metrics.swaps
+        twoq_ok = reference.metrics.two_qubit_depth > 0 and candidate.metrics.two_qubit_depth <= ratio * reference.metrics.two_qubit_depth
+        duration_ref = reference.metrics.total_duration_ns
+        duration_ok = (
+            duration_ref is None
+            or duration_ref <= 0
+            or candidate.metrics.total_duration_ns is None
+            or candidate.metrics.total_duration_ns <= ratio * duration_ref
+        )
+        return not (swaps_ok and twoq_ok and duration_ok)
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------- CLI
@@ -156,7 +182,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--residual-top-k",
         type=int,
-        default=8,
+        default=4,
         help="Top-K teacher candidates passed to residual scorer.",
     )
     parser.add_argument(
@@ -169,6 +195,42 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Blend teacher score into residual utilities (larger = closer to teacher).",
+    )
+    parser.add_argument(
+        "--residual-multistep",
+        action="store_true",
+        help="Use bounded multi-step residual search instead of 1-step residual_topk.",
+    )
+    parser.add_argument(
+        "--residual-horizon",
+        type=int,
+        default=2,
+        choices=[2, 3],
+        help="Lookahead horizon for multistep residual search (2 or 3).",
+    )
+    parser.add_argument(
+        "--residual-branch-k",
+        type=int,
+        default=2,
+        help="Teacher top-K branching factor beyond depth-1 for multistep search.",
+    )
+    parser.add_argument(
+        "--residual-swap-penalty",
+        type=float,
+        default=0.15,
+        help="Per-swap penalty subtracted from multistep utility.",
+    )
+    parser.add_argument(
+        "--residual-duration-scale",
+        type=float,
+        default=5e-4,
+        help="Scale factor converting ns duration to utility penalty in multistep search.",
+    )
+    parser.add_argument(
+        "--residual-progress-weight",
+        type=float,
+        default=0.1,
+        help="Weight on frontier-distance improvement inside multistep utility.",
     )
     parser.add_argument(
         "--include-teacher",
@@ -514,7 +576,10 @@ def main(argv: list[str] | None = None) -> int:
 
     il_ckpt = args.il_checkpoint or _default_checkpoint(out_dir, ["il_soft", "il"])
     rl_ckpt = args.rl_checkpoint or _default_checkpoint(out_dir, ["rl_ppo", "rl"])
-    residual_ckpt = args.residual_checkpoint or _default_checkpoint(out_dir, ["residual_topk"])
+    if args.residual_multistep:
+        residual_ckpt = args.residual_checkpoint
+    else:
+        residual_ckpt = args.residual_checkpoint or _default_checkpoint(out_dir, ["residual_topk"])
     il_name = args.il_name
     if il_name is None:
         if il_ckpt and "il_soft" in il_ckpt.name:
@@ -527,21 +592,43 @@ def main(argv: list[str] | None = None) -> int:
             rl_name = "rl_ppo"
         else:
             rl_name = "rl_policy"
-    residual_name = "residual_topk"
+    residual_name = "residual_multistep" if args.residual_multistep else "residual_topk"
     il_model = load_swap_policy(il_ckpt) if il_ckpt and Path(il_ckpt).exists() else None
     rl_model = load_swap_policy(rl_ckpt) if rl_ckpt and Path(rl_ckpt).exists() else None
     residual_model = None
-    if residual_ckpt and Path(residual_ckpt).exists():
-        residual_model = load_residual_policy(
-            residual_ckpt,
+    residual_scorer = None
+    if args.residual_multistep:
+        if residual_ckpt and Path(residual_ckpt).exists():
+            try:
+                residual_scorer = load_residual_scorer(residual_ckpt)
+            except Exception as exc:  # pragma: no cover - defensive
+                print(f"[warn] failed to load residual scorer from {residual_ckpt}: {exc}")
+        elif args.residual_checkpoint:
+            print(
+                f"[warn] residual checkpoint missing at {args.residual_checkpoint}, proceeding without scorer."
+            )
+        cfg = MultiStepConfig(
             top_k=args.residual_top_k,
-            allow_fallback=not args.residual_no_fallback,
-            teacher_bias=args.residual_teacher_bias,
+            branch_k=args.residual_branch_k,
+            horizon=args.residual_horizon,
+            swap_penalty=args.residual_swap_penalty,
+            duration_scale=args.residual_duration_scale,
+            progress_weight=args.residual_progress_weight,
+            include_hardware=True,
         )
-    elif args.residual_checkpoint:
-        print(
-            f"[warn] residual checkpoint missing at {args.residual_checkpoint}, skipping residual_topk."
-        )
+        residual_model = MultiStepResidualPolicy(config=cfg, scorer=residual_scorer)
+    else:
+        if residual_ckpt and Path(residual_ckpt).exists():
+            residual_model = load_residual_policy(
+                residual_ckpt,
+                top_k=args.residual_top_k,
+                allow_fallback=not args.residual_no_fallback,
+                teacher_bias=args.residual_teacher_bias,
+            )
+        elif args.residual_checkpoint:
+            print(
+                f"[warn] residual checkpoint missing at {args.residual_checkpoint}, skipping residual_topk."
+            )
 
     records: list[dict[str, object]] = []
     for circuit in circuits:
@@ -626,19 +713,47 @@ def main(argv: list[str] | None = None) -> int:
                             )
                     if residual_model is not None:
                         try:
-                            residual_result = route_with_residual_policy(
-                                residual_model,
-                                circuit.circuit,
-                                coupling,
-                                name=residual_name,
-                                seed=seed,
-                                hardware_model=hw_model,
-                            )
+                            if args.residual_multistep:
+                                residual_result = route_with_multistep_residual(
+                                    residual_model,
+                                    circuit.circuit,
+                                    coupling,
+                                    name=residual_name,
+                                    seed=seed,
+                                    hardware_model=hw_model,
+                                )
+                            else:
+                                residual_result = route_with_residual_policy(
+                                    residual_model,
+                                    circuit.circuit,
+                                    coupling,
+                                    name=residual_name,
+                                    seed=seed,
+                                    hardware_model=hw_model,
+                                )
                         except Exception as exc:  # pragma: no cover - defensive
                             print(
                                 f"[warn] Residual policy failed on {circuit.circuit_id} {graph_id}: {exc}"
                             )
                         else:
+                            if args.residual_multistep:
+                                ref = None
+                                for b in baselines:
+                                    if b.name == "qiskit_sabre_best":
+                                        ref = b
+                                        break
+                                if ref is not None:
+                                    extra = getattr(residual_result, "extra", {}) or {}
+                                    violation = _violates_constraint(residual_result, ref)
+                                    extra.update(
+                                        {
+                                            "constraint_violation": violation,
+                                            "constraint_ref_swaps": ref.metrics.swaps,
+                                            "constraint_ref_twoq_depth": ref.metrics.two_qubit_depth,
+                                            "constraint_ref_duration_ns": ref.metrics.total_duration_ns,
+                                        }
+                                    )
+                                    residual_result.extra = extra
                             records.append(
                                 _result_record(
                                     circuit,
@@ -730,10 +845,28 @@ def main(argv: list[str] | None = None) -> int:
             "rl_swap_guard": args.rl_swap_guard if rl_model else None,
             "il_allow_fallback": (not args.il_no_fallback) if il_model else None,
             "rl_allow_fallback": (not args.rl_no_fallback) if rl_model else None,
-            "residual_allow_fallback": (not args.residual_no_fallback) if residual_model else None,
+            "residual_allow_fallback": (not args.residual_no_fallback)
+            if residual_model and not args.residual_multistep
+            else None,
             "residual_top_k": args.residual_top_k if residual_model else None,
             "residual_checkpoint": str(residual_ckpt) if residual_ckpt and residual_model else None,
-            "residual_teacher_bias": args.residual_teacher_bias if residual_model else None,
+            "residual_teacher_bias": args.residual_teacher_bias
+            if residual_model and not args.residual_multistep
+            else None,
+            "residual_multistep": args.residual_multistep if residual_model else None,
+            "residual_horizon": args.residual_horizon if residual_model and args.residual_multistep else None,
+            "residual_branch_k": args.residual_branch_k
+            if residual_model and args.residual_multistep
+            else None,
+            "residual_swap_penalty": args.residual_swap_penalty
+            if residual_model and args.residual_multistep
+            else None,
+            "residual_duration_scale": args.residual_duration_scale
+            if residual_model and args.residual_multistep
+            else None,
+            "residual_progress_weight": args.residual_progress_weight
+            if residual_model and args.residual_multistep
+            else None,
             "include_teacher": args.include_teacher,
             "hardware_seeds": hardware_seeds,
             "hardware_profile": args.hardware_profile,
