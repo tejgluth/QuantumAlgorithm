@@ -17,6 +17,7 @@ from qiskit.transpiler import CouplingMap
 
 from quantum_routing_rl.baselines.qiskit_baselines import (
     run_best_available_sabre,
+    run_qiskit_sabre_trials,
     run_sabre_layout_swap,
 )
 from quantum_routing_rl.benchmarks.qasmbench_loader import QasmCircuit, load_suite
@@ -121,6 +122,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         nargs="+",
         help="Seeds for baselines and learned policies (>=3 for full).",
+    )
+    parser.add_argument(
+        "--qiskit-trials",
+        type=int,
+        default=1,
+        help="Run Qiskit SABRE this many times and pick the best (fair-trials baseline).",
     )
     parser.add_argument(
         "--pressure-seed",
@@ -650,6 +657,7 @@ def main(argv: list[str] | None = None) -> int:
         directional=args.hardware_directional,
         crosstalk_factor=max(0.0, args.hardware_crosstalk),
     )
+    qiskit_trials = max(1, int(args.qiskit_trials))
     weighted_params = WeightedDistanceParams(
         alpha_time=args.weighted_alpha_time,
         beta_xtalk=args.weighted_beta_xtalk,
@@ -739,6 +747,16 @@ def main(argv: list[str] | None = None) -> int:
                             circuit.circuit, coupling, seed=seed, hardware_model=hw_model
                         ),
                     ]
+                    if qiskit_trials > 1:
+                        baselines.append(
+                            run_qiskit_sabre_trials(
+                                circuit.circuit,
+                                coupling,
+                                seed=seed,
+                                trials=qiskit_trials,
+                                hardware_model=hw_model,
+                            )
+                        )
                     for result in baselines:
                         records.append(
                             _result_record(
@@ -1025,6 +1043,7 @@ def main(argv: list[str] | None = None) -> int:
             "hardware_directional": args.hardware_directional,
             "hardware_crosstalk": args.hardware_crosstalk,
             "hardware_draws": max(1, args.hardware_samples),
+            "qiskit_trials": qiskit_trials,
         }
     )
     metadata_path.write_text(json.dumps(metadata, indent=2))

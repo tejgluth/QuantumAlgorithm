@@ -4,7 +4,7 @@ from qiskit import QuantumCircuit
 from qiskit.transpiler import CouplingMap
 
 from quantum_routing_rl.benchmarks.qasmbench_loader import QasmCircuit
-from quantum_routing_rl.models.il_train import (
+from experiments.legacy_rl.il_train import (
     collect_dataset,
     record_traces_for_circuit,
     save_checkpoint,

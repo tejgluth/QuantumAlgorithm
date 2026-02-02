@@ -6,7 +6,7 @@ from qiskit.transpiler import CouplingMap
 from types import SimpleNamespace
 
 from quantum_routing_rl.benchmarks.qasmbench_loader import QasmCircuit
-from quantum_routing_rl.models.rl_train import save_checkpoint, train_rl
+from experiments.legacy_rl.rl_train import save_checkpoint, train_rl
 
 
 def _dummy_circuit() -> QasmCircuit:

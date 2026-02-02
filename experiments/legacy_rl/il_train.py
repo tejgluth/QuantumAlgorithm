@@ -53,7 +53,7 @@ class TraceSample:
     meta: dict
 
 
-TraceSample.__module__ = "quantum_routing_rl.models.il_train"
+TraceSample.__module__ = "experiments.legacy_rl.il_train"
 PRESSURE_GRAPHS = ("ring_8", "grid_3x3", "heavy_hex_15")
 GRAPH_SPECS = {
     "ring_8": {"n_qubits": 8, "twoq_layers": 18},

@@ -88,6 +88,17 @@ def _ablation_notes() -> dict[str, str]:
     }
 
 
+def _cliffs_label(delta: float) -> str:
+    val = abs(delta)
+    if val < 0.147:
+        return "negligible"
+    if val < 0.33:
+        return "small"
+    if val < 0.474:
+        return "medium"
+    return "large"
+
+
 # --------------------------------------------------------------------------- tables
 def build_main_table(results: pd.DataFrame, summary: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
@@ -219,6 +230,31 @@ def build_variance_table(variance_df: pd.DataFrame) -> pd.DataFrame:
     keep_cols = ["graph_id", "baseline_name", "Hardware %", "Seed %", "Residual %"]
     renamed = filtered[keep_cols].rename(columns={"graph_id": "Graph", "baseline_name": "Baseline"})
     return renamed.sort_values(["Graph", "Baseline"])
+
+
+def build_significance_table(significance: pd.DataFrame, effect_size: pd.DataFrame) -> pd.DataFrame:
+    sig_cols = significance[
+        ["graph_id", "pairs", "mean_delta", "ci_lower", "ci_upper", "p_value", "positive_frac"]
+    ]
+    eff_cols = effect_size[["graph_id", "cliffs_delta"]]
+    merged = pd.merge(sig_cols, eff_cols, on="graph_id", how="inner")
+
+    rows: list[dict[str, object]] = []
+    for _, row in merged.iterrows():
+        ci_text = f"{row['mean_delta']:+.3f} [{row['ci_lower']:+.3f}, {row['ci_upper']:+.3f}]"
+        label = _cliffs_label(float(row["cliffs_delta"]))
+        rows.append(
+            {
+                "Graph": row["graph_id"],
+                "Pairs": int(row["pairs"]),
+                "Δ overall_log_success (95% CI)": ci_text,
+                "Positive fraction": f"{row['positive_frac']:.3f}",
+                "p_value": float(row["p_value"]),
+                "Cliff's δ": float(row["cliffs_delta"]),
+                "Effect size": label,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 # --------------------------------------------------------------------------- plots
@@ -481,6 +517,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=Path("artifacts/metadata.json"),
         help="Metadata JSON to update with version pinning.",
     )
+    parser.add_argument(
+        "--significance",
+        type=Path,
+        default=Path("artifacts/statistics/significance.csv"),
+        help="CSV with paired significance results.",
+    )
+    parser.add_argument(
+        "--effect-size",
+        type=Path,
+        default=Path("artifacts/statistics/effect_size.csv"),
+        help="CSV with effect size metrics (Cliff's delta, Cohen's d).",
+    )
     return parser.parse_args(argv)
 
 
@@ -492,6 +540,8 @@ def main(argv: list[str] | None = None) -> int:
     variance_df = pd.read_csv(args.variance)
     ablation_results = _load_ablation_results(args.ablation_root)
     ablation_ratios = pd.read_csv(args.ablation_ratios)
+    significance_df = pd.read_csv(args.significance)
+    effect_size_df = pd.read_csv(args.effect_size)
 
     main_raw = build_main_table(results, summary)
     write_main_table(main_raw, args.tables_out)
@@ -501,6 +551,9 @@ def main(argv: list[str] | None = None) -> int:
 
     variance_table = build_variance_table(variance_df)
     write_table(variance_table, "variance", args.tables_out)
+
+    significance_table = build_significance_table(significance_df, effect_size_df)
+    write_table(significance_table, "significance_effect", args.tables_out)
 
     plot_main_results(main_raw, args.plots_out)
     plot_yield_overhead(args.yield_points, args.plots_out)

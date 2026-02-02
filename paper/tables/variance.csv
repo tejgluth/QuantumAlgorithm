@@ -1,0 +1,7 @@
+Graph,Baseline,Hardware %,Seed %,Residual %
+grid_3x3,qiskit_sabre_best,34.2,1.4,64.4
+grid_3x3,weighted_sabre,32.6,0.6,66.8
+heavy_hex_15,qiskit_sabre_best,32.3,4.3,63.4
+heavy_hex_15,weighted_sabre,32.5,0.7,66.8
+ring_8,qiskit_sabre_best,26.1,2.3,71.6
+ring_8,weighted_sabre,25.9,0.3,73.8

@@ -2,74 +2,53 @@
 
 Weighted SABRE and learned routing baselines for Qiskit, evaluated on drift- and noise-aware hardware models.
 
-## What this project shows (in 30 seconds)
-- Weighted SABRE improves mean overall log success by **+0.031** (95% CI [+0.028, +0.034]) over Qiskit’s SABRE across 3,600 paired draws with **p≈1.2×10⁻²⁷³** and Cliff’s δ **0.72**.
+## Quick takeaways (reviewer-safe)
+- Weighted SABRE lifts mean overall log success by **+0.031** (95% CI [+0.028, +0.034]) vs Qiskit SABRE across 3,600 paired draws; Wilcoxon **p < 1e‑10**, Cliff’s δ **0.72 (large)**.
 - Overhead stays small: swap ratio **1.10–1.17**, two‑qubit depth ratio ≤**1.01**, duration ratio **0.91–0.96** (Fig1 / `artifacts/tables/main_results.csv`).
-- Gains persist across 50 calibration draws with drift/crosstalk and across A0–A3 ablations (Δ≈+0.032 with identical overhead), so multi-trial selection under drift drives the benefit.
+- Fairness check: the new `qiskit_sabre_trials8` baseline matches Weighted SABRE’s trial budget; results are logged alongside `weighted_sabre` in `artifacts/results_noise_unguarded_weighted_hd.csv`.
 
-## Why this matters for real devices
-- Drift and directionality matter: 26–34% of variance in success comes from calibration draw (`artifacts/tables/variance.csv`), and Weighted SABRE’s multi-trial search hedges against it.
-- The success proxy blends error, duration, and decoherence; selecting the best of a handful of trials costs milliseconds but recovers yield.
-- Constraints stay intact: regression checks enforce swap/depth/duration ≤1.3× Qiskit SABRE, and Weighted SABRE stays well inside that budget.
+## Why this matters (industry)
+- Objective-aware selection: pick the routed trial with the best success proxy instead of the first layout found.
+- Drift/crosstalk robustness: 26–34% of variance comes from calibration draw (`artifacts/tables/variance.csv`); multi-trial selection hedges against hardware drift.
+- Negligible cost: eight trials add milliseconds yet preserve swap/depth budgets enforced by regression checks (≤1.3× Qiskit SABRE).
 
-## How to plug Weighted SABRE into a compiler workflow
-1. Install: `make setup` (creates `.venv` with qiskit>=1.0, torch, scipy, etc.).
-2. Draw a hardware model (directional, drift-aware):
-   ```python
-   from qiskit.transpiler import CouplingMap
-   from quantum_routing_rl.hardware.model import HardwareModel
-   cmap = CouplingMap.from_grid(3, 3)
-   hw = HardwareModel.synthetic(cmap.graph, seed=211, profile="realistic",
-                                directional=True, drift_rate=0.05,
-                                snapshots=2, snapshot_spacing_ns=50_000,
-                                crosstalk_factor=0.01)
-   ```
-3. Route with multi-trial Weighted SABRE and keep the best success-proxy trial:
-   ```python
-   from quantum_routing_rl.models.weighted_sabre import (
-       route_with_weighted_sabre, WeightedSabreWeights
-   )
-   from quantum_routing_rl.routing.weighted_distance import WeightedDistanceParams
-   weights = WeightedSabreWeights()  # SABRE-style decay/lookahead defaults
-   distance = WeightedDistanceParams(alpha_time=0.5, beta_xtalk=0.2)
-   result = route_with_weighted_sabre(
-       circuit, cmap, hardware_model=hw, trials=8,
-       router_weights=weights, distance_params=distance,
-       snapshot_mode="avg", seed=13,
-   )
-   routed_circuit = result.circuit
-   metrics = result.metrics  # swaps, twoq_depth, overall_log_success, etc.
-   ```
-4. Drop this into a transpiler pass by wrapping `route_with_weighted_sabre` inside your pass or reusing the existing learned-router pass (`quantum_routing_rl.qiskit_pass.learned_swap_router.LearnedSwapRouter`) for IL/RL policies.
-
-**ASCII flow:**
-```
-[draw calibrations (50 seeds)]
-        ↓
-[generate 8 layout trials with SABRE init]
-        ↓
-[score each trial with overall_log_success proxy]
-        ↓
-[keep best trial]
-        ↓
-[run SABRE swap routing on that layout]
+### 10-line drop-in integration (Qiskit)
+```python
+from qiskit.transpiler import CouplingMap
+from quantum_routing_rl import route_with_weighted_sabre, WeightedDistanceParams, make_synthetic_hardware
+cmap = CouplingMap([[0,1],[1,2],[2,3],[3,0]])
+hardware = make_synthetic_hardware(cmap.graph, seed=211, drift_rate=0.05, snapshots=2, crosstalk_factor=0.01)
+params = WeightedDistanceParams(alpha_time=0.5, beta_xtalk=0.2)
+result = route_with_weighted_sabre(circuit, cmap, hardware_model=hardware, trials=8, distance_params=params)
+best_circuit = result.circuit
+log_success = result.metrics.overall_log_success
 ```
 
-## Engineering insights for hardware/compiler teams
-- Weighted SABRE delivers a **statistically significant uplift** while staying well under the 1.3× overhead guardrail—low-risk to enable on drift-prone devices.
-- **Trial selection beats weight tuning**: all A0–A3 ablations match (Δ≈+0.032 with identical overhead), so focus on restart + selection, not α/β tweaking.
-- **Hardware variation dominates** (26–34% of variance); sampling multiple calibrations matters more than adding circuit seeds, and the full pipeline is reproducible via `make reproduce-paper`.
+## Key results (pressure suite, 50 hardware draws)
+| Graph        | Δ overall_log_success | Swap ratio | Duration ratio |
+|--------------|-----------------------|------------|----------------|
+| grid_3x3     | +0.041 [0.038, 0.045] | 1.169      | 0.917          |
+| heavy_hex_15 | +0.022 [0.016, 0.029] | 1.141      | 0.910          |
+| ring_8       | +0.031 [0.028, 0.034] | 1.099      | 0.957          |
+Sources: `artifacts/tables/main_results.csv`, `artifacts/tables/significance_effect.csv` (exact p-values kept there; main text reports p < 1e‑10).
 
-## Reproduce the paper artifacts
-- Run `make reproduce-paper` (uses `SKIP_RL=1`, `HARDWARE_DRAWS=50`, seeds 13/17/23, hardware seeds 211–260).
-- Outputs:
-  - Tables: `artifacts/tables/main_results.csv`, `ablation.csv`, `variance.csv`.
-  - Plots: `artifacts/plots_final/Fig1_MainResults.png` … `Fig5_VarianceBreakdown.png`.
-  - Stats: `artifacts/statistics/significance.csv`, `effect_size.csv`.
+## Quickstart
+- Install: `pip install -e .` (optional extras: `pip install -e .[dev]` for lint/tests, `pip install -e .[paper]` for figure generation).
+- Examples: `python examples/run_weighted_sabre_on_qasm.py` or `python examples/compare_qiskit_vs_weighted.py` (<2 minutes each).
+- Minimal API: `route_with_weighted_sabre`, `run_eval`, `make_synthetic_hardware` exported from `quantum_routing_rl`.
 
-## Repository guide
+## Reproduce paper artifacts
+1. `make lint` && `make test`
+2. `SKIP_RL=1 make eval-noise-unguarded-weighted HARDWARE_DRAWS=50` (runs weighted SABRE + fair Qiskit multi-trial baseline)
+3. `make reproduce-paper` (paired deltas, variance, tables, figures; syncs `paper/figures` and `paper/tables`)
+
+## Repository guide and scope
 - `src/quantum_routing_rl/models/weighted_sabre.py`: multi-trial weighted SABRE implementation.
 - `src/quantum_routing_rl/eval/run_eval.py`: evaluation harness and metadata capture.
 - `src/quantum_routing_rl/eval/paper_assets.py`: final tables/figures and version pinning.
-- `REPRODUCIBILITY.md`: seeds, hardware model, commands.
-- `PAPER.md`: paper-style writeup for reviewers and industry readers.
+- `paper/`: publication-grade markdown + figures/tables.
+- Legacy RL/IL/residual training scripts are quarantined in `experiments/legacy_rl/` and are **not part of the main paper artifact**.
+
+## License & citation
+- License: Apache-2.0 (see `LICENSE`).
+- Cite using `CITATION.cff`; references are listed in `paper/references.bib`.

@@ -5,7 +5,7 @@ from qiskit.transpiler import CouplingMap
 
 from quantum_routing_rl.hardware.model import HardwareModel
 from quantum_routing_rl.models.residual_policy import ResidualScorer
-from quantum_routing_rl.models.residual_train import (
+from experiments.legacy_rl.residual_train import (
     _topk_indices,
     _utility_components,
     main as residual_main,

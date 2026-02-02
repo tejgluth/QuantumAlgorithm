@@ -1,0 +1,10 @@
+\begin{tabular}{lllllll}
+\toprule
+Ablation & Weighted overall_log_success (95% CI) & Swap ratio & 2Q depth ratio & Duration ratio & Δ vs Qiskit & Interpretation \\
+\midrule
+A0_hop & **-0.306 ± 0.019** & 1.124 & 0.988 & 0.926 & +0.032 & Hop-distance only (α=0, β=0, trials=8) \\
+A1_time & **-0.306 ± 0.019** & 1.124 & 0.988 & 0.926 & +0.032 & Adds duration weighting only (α=0.5, β=0) \\
+A2_xtalk & **-0.306 ± 0.019** & 1.124 & 0.988 & 0.926 & +0.032 & Adds crosstalk weighting only (α=0, β=0.2) \\
+A3_full & **-0.306 ± 0.019** & 1.124 & 0.988 & 0.926 & +0.032 & Full weighting (α=0.5, β=0.2) \\
+\bottomrule
+\end{tabular}

@@ -26,7 +26,7 @@ make reproduce-paper
 ```
 
 This performs (skipping reruns when outputs already exist):
-- Weighted SABRE pressure evaluation with noise/drift (`results_noise_unguarded_weighted_hd.csv`, `summary_noise_unguarded_weighted_hd.csv`).
+- Weighted SABRE pressure evaluation with noise/drift (`results_noise_unguarded_weighted_hd.csv`, `summary_noise_unguarded_weighted_hd.csv`) including the fair multi-trial baseline `qiskit_sabre_trials8`.
 - Paired deltas + Wilcoxon + effect sizes (`artifacts/deltas/`, `artifacts/statistics/`).
 - Variance breakdown (`artifacts/variance/variance_breakdown.csv`).
 - Ablation sweep A0–A3 (`artifacts/summary_ablation*.csv`).
