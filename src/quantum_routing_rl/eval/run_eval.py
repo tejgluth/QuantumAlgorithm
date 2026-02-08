@@ -10,18 +10,24 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
-import pandas as pd
 import networkx as nx
+import pandas as pd
 from qiskit import __version__ as qiskit_version
 from qiskit.transpiler import CouplingMap
 
 from quantum_routing_rl.baselines.qiskit_baselines import (
     run_best_available_sabre,
+    run_preset_opt3,
     run_qiskit_sabre_trials,
     run_sabre_layout_swap,
 )
+from quantum_routing_rl.benchmarks.gauntlet_manager import GauntletSuite, build_suite
 from quantum_routing_rl.benchmarks.qasmbench_loader import QasmCircuit, load_suite
 from quantum_routing_rl.benchmarks.synthetic_generator import pressure_suite
+from quantum_routing_rl.benchmarks.topologies import (
+    coupling_maps_for,
+    tiered_topologies,
+)
 from quantum_routing_rl.models.policy import load_swap_policy, route_with_policy
 from quantum_routing_rl.models.residual_policy import (
     load_residual_policy,
@@ -92,7 +98,11 @@ def _violates_constraint(candidate, reference, ratio: float = 1.3) -> bool:
 # --------------------------------------------------------------------------- CLI
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", choices=["dev", "pressure", "full"], default="dev")
+    parser.add_argument(
+        "--suite",
+        default="dev",
+        help="Suite name (dev/pressure/full or gauntlet:<tier>).",
+    )
     parser.add_argument("--dev-limit", type=int, default=20, help="Max circuits for dev suite.")
     parser.add_argument("--out", type=Path, required=True, help="Output directory for artifacts.")
     parser.add_argument(
@@ -124,10 +134,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Seeds for baselines and learned policies (>=3 for full).",
     )
     parser.add_argument(
+        "--selection-seed",
+        type=int,
+        default=0,
+        help="Deterministic seed for benchmark selection / synthetic generation.",
+    )
+    parser.add_argument(
         "--qiskit-trials",
         type=int,
-        default=1,
-        help="Run Qiskit SABRE this many times and pick the best (fair-trials baseline).",
+        nargs="+",
+        default=[1],
+        help="Run Qiskit SABRE with the provided trial budgets and log each best-of-N baseline (e.g., --qiskit-trials 1 8 16).",
     )
     parser.add_argument(
         "--pressure-seed",
@@ -262,6 +279,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Evaluate the weighted SABRE router using hardware-aware distances.",
     )
     parser.add_argument(
+        "--run-preset-opt3",
+        action="store_true",
+        help="Evaluate Qiskit's preset pass manager at optimization_level=3 (non-SABRE strong baseline).",
+    )
+    parser.add_argument(
         "--weighted-alpha-time",
         type=float,
         default=0.0,
@@ -383,61 +405,16 @@ def _default_qasm_root() -> Path:
 
 
 def _build_coupling_maps(suite: str) -> dict[str, CouplingMap]:
-    base = {
-        "line_3": CouplingMap([[0, 1], [1, 2]]),
-        "square_4": CouplingMap([[0, 1], [1, 2], [2, 3], [3, 0]]),
-    }
-    pressure = {
-        "ring_8": CouplingMap([[i, (i + 1) % 8] for i in range(8)]),
-        "grid_3x3": CouplingMap(
-            [
-                [0, 1],
-                [1, 2],
-                [3, 4],
-                [4, 5],
-                [6, 7],
-                [7, 8],
-                [0, 3],
-                [3, 6],
-                [1, 4],
-                [4, 7],
-                [2, 5],
-                [5, 8],
-            ]
-        ),
-        "heavy_hex_15": CouplingMap(
-            [
-                [0, 1],
-                [1, 2],
-                [2, 3],
-                [3, 4],
-                [0, 5],
-                [2, 6],
-                [4, 7],
-                [5, 6],
-                [6, 7],
-                [5, 8],
-                [6, 9],
-                [7, 10],
-                [8, 9],
-                [9, 10],
-                [8, 11],
-                [9, 12],
-                [10, 13],
-                [11, 12],
-                [12, 13],
-                [11, 14],
-                [13, 14],
-            ]
-        ),
-    }
     if suite == "dev":
-        return base
+        return coupling_maps_for(["line_3", "square_4"])
     if suite == "pressure":
-        return pressure
-    merged = dict(base)
-    merged.update(pressure)
-    return merged
+        return coupling_maps_for(["ring_8", "grid_3x3", "heavy_hex_15"])
+    if suite == "full":
+        maps = coupling_maps_for(["line_3", "square_4", "ring_8", "grid_3x3", "heavy_hex_15"])
+        # Add richer topologies when running full evaluations.
+        maps.update(tiered_topologies("medium"))
+        return maps
+    return coupling_maps_for(["line_3", "square_4"])
 
 
 def _coupling_size(map_obj: CouplingMap) -> int:
@@ -491,7 +468,13 @@ def _filter_coupling_maps(
 
 
 def _load_benchmarks(
-    suite: str, qasm_root: Path, *, dev_limit: int, pressure_seed: int, pressure_qasm: int
+    suite: str,
+    qasm_root: Path,
+    *,
+    dev_limit: int,
+    pressure_seed: int,
+    pressure_qasm: int,
+    selection_seed: int,
 ) -> list[QasmCircuit]:
     circuits: list[QasmCircuit] = []
     seen_ids: set[str] = set()
@@ -509,12 +492,20 @@ def _load_benchmarks(
                 qasm_root,
                 suite="dev" if suite == "dev" else "full",
                 dev_limit=dev_limit,
+                selection_seed=selection_seed,
             )
         )
     if suite in {"pressure", "full"}:
         _append_unique(pressure_suite(seed=pressure_seed))
         # A few real circuits to complement synthetic pressure cases.
-        _append_unique(load_suite(qasm_root, suite="dev", dev_limit=pressure_qasm))
+        _append_unique(
+            load_suite(
+                qasm_root,
+                suite="dev",
+                dev_limit=pressure_qasm,
+                selection_seed=selection_seed,
+            )
+        )
     return circuits
 
 
@@ -637,15 +628,36 @@ def main(argv: list[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     seeds = args.seeds or ([args.seed] if args.seed is not None else [13])
+    selection_seed = args.selection_seed
     qasm_root = Path(args.qasm_root or _default_qasm_root()).expanduser()
-    circuits = _load_benchmarks(
-        args.suite,
-        qasm_root,
-        dev_limit=args.dev_limit,
-        pressure_seed=args.pressure_seed,
-        pressure_qasm=args.pressure_qasm,
-    )
-    coupling_maps = _build_coupling_maps(args.suite)
+
+    gauntlet_suite: GauntletSuite | None = None
+    suite_label = args.suite
+    if args.suite.startswith("gauntlet:"):
+        g_name = args.suite.split(":", 1)[1]
+        gauntlet_suite = build_suite(
+            g_name,
+            qasm_root=qasm_root,
+            selection_seed=selection_seed,
+            pressure_seed=args.pressure_seed,
+        )
+        if not gauntlet_suite.is_ready():
+            reason = gauntlet_suite.skip_reason or "no circuits available"
+            msg = f"Gauntlet suite '{g_name}' unavailable: {reason}"
+            raise RuntimeError(msg)
+        circuits = gauntlet_suite.circuits
+        coupling_maps = gauntlet_suite.topologies
+        suite_label = f"gauntlet:{gauntlet_suite.name}"
+    else:
+        circuits = _load_benchmarks(
+            args.suite,
+            qasm_root,
+            dev_limit=args.dev_limit,
+            pressure_seed=args.pressure_seed,
+            pressure_qasm=args.pressure_qasm,
+            selection_seed=selection_seed,
+        )
+        coupling_maps = _build_coupling_maps(args.suite)
     hardware_seeds = [args.hardware_seed_base + i for i in range(max(1, args.hardware_samples))]
     hardware_models = _build_hardware_models(
         coupling_maps,
@@ -657,7 +669,16 @@ def main(argv: list[str] | None = None) -> int:
         directional=args.hardware_directional,
         crosstalk_factor=max(0.0, args.hardware_crosstalk),
     )
-    qiskit_trials = max(1, int(args.qiskit_trials))
+    qiskit_trial_budgets: list[int] = []
+    seen_trial_values: set[int] = set()
+    for val in args.qiskit_trials:
+        budget = max(1, int(val))
+        if budget in seen_trial_values:
+            continue
+        seen_trial_values.add(budget)
+        qiskit_trial_budgets.append(budget)
+    if not qiskit_trial_budgets:
+        qiskit_trial_budgets = [1]
     weighted_params = WeightedDistanceParams(
         alpha_time=args.weighted_alpha_time,
         beta_xtalk=args.weighted_beta_xtalk,
@@ -747,13 +768,22 @@ def main(argv: list[str] | None = None) -> int:
                             circuit.circuit, coupling, seed=seed, hardware_model=hw_model
                         ),
                     ]
-                    if qiskit_trials > 1:
+                    if args.run_preset_opt3:
+                        baselines.append(
+                            run_preset_opt3(
+                                circuit.circuit,
+                                coupling,
+                                seed=seed,
+                                hardware_model=hw_model,
+                            )
+                        )
+                    for trials in qiskit_trial_budgets:
                         baselines.append(
                             run_qiskit_sabre_trials(
                                 circuit.circuit,
                                 coupling,
                                 seed=seed,
-                                trials=qiskit_trials,
+                                trials=trials,
                                 hardware_model=hw_model,
                             )
                         )
@@ -764,7 +794,7 @@ def main(argv: list[str] | None = None) -> int:
                                 graph_id,
                                 result,
                                 seed=seed,
-                                suite=args.suite,
+                                suite=suite_label,
                                 hardware_seed=hw_seed,
                                 hardware_profile=args.hardware_profile,
                             )
@@ -784,7 +814,7 @@ def main(argv: list[str] | None = None) -> int:
                                 graph_id,
                                 teacher_result,
                                 seed=seed,
-                                suite=args.suite,
+                                suite=suite_label,
                                 hardware_seed=hw_seed,
                                 hardware_profile=args.hardware_profile,
                             )
@@ -818,7 +848,7 @@ def main(argv: list[str] | None = None) -> int:
                                         graph_id,
                                         weighted_result,
                                         seed=seed,
-                                        suite=args.suite,
+                                        suite=suite_label,
                                         hardware_seed=hw_seed,
                                         hardware_profile=args.hardware_profile,
                                     )
@@ -848,7 +878,7 @@ def main(argv: list[str] | None = None) -> int:
                                     graph_id,
                                     il_result,
                                     seed=seed,
-                                    suite=args.suite,
+                                    suite=suite_label,
                                     hardware_seed=hw_seed,
                                     hardware_profile=args.hardware_profile,
                                 )
@@ -902,7 +932,7 @@ def main(argv: list[str] | None = None) -> int:
                                     graph_id,
                                     residual_result,
                                     seed=seed,
-                                    suite=args.suite,
+                                    suite=suite_label,
                                     hardware_seed=hw_seed,
                                     hardware_profile=args.hardware_profile,
                                 )
@@ -932,7 +962,7 @@ def main(argv: list[str] | None = None) -> int:
                                     graph_id,
                                     rl_result,
                                     seed=seed,
-                                    suite=args.suite,
+                                    suite=suite_label,
                                     hardware_seed=hw_seed,
                                     hardware_profile=args.hardware_profile,
                                 )
@@ -965,17 +995,23 @@ def main(argv: list[str] | None = None) -> int:
             existing_meta = {}
     metadata = _collect_metadata()
     metadata.update(existing_meta)
+    suite_sources = gauntlet_suite.metadata.get("sources", []) if gauntlet_suite else []
+    gauntlet_meta = gauntlet_suite.metadata if gauntlet_suite else {}
     metadata.update(
         {
             "suite": args.suite,
+            "suite_label": suite_label,
             "dev_limit": args.dev_limit,
             "qasm_root": str(qasm_root),
             "results": str(results_path),
             "summary": str(summary_path),
             "summary_std": str(summary_std_path) if summary_std_path else None,
             "seeds": seeds,
+            "selection_seed": selection_seed,
             "circuits_evaluated": len(circuits),
             "coupling_maps": list(coupling_maps.keys()),
+            "benchmark_sources": suite_sources,
+            "gauntlet_metadata": gauntlet_meta,
             "il_checkpoint": str(il_ckpt) if il_ckpt else None,
             "rl_checkpoint": str(rl_ckpt) if rl_ckpt else None,
             "il_name": il_name if il_model else None,
@@ -1043,7 +1079,8 @@ def main(argv: list[str] | None = None) -> int:
             "hardware_directional": args.hardware_directional,
             "hardware_crosstalk": args.hardware_crosstalk,
             "hardware_draws": max(1, args.hardware_samples),
-            "qiskit_trials": qiskit_trials,
+            "qiskit_trials": qiskit_trial_budgets,
+            "run_preset_opt3": args.run_preset_opt3,
         }
     )
     metadata_path.write_text(json.dumps(metadata, indent=2))

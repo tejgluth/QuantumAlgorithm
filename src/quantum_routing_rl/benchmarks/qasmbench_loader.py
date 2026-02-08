@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -18,13 +20,24 @@ class QasmCircuit:
     circuit: QuantumCircuit
 
 
-def discover_qasm_files(root: str | Path) -> list[Path]:
+def _resolve_root(root: str | Path | None) -> Path:
+    """Prefer explicit root, fall back to env var."""
+    if root is not None:
+        return Path(root).expanduser().resolve()
+    env_path = os.environ.get("QASMBENCH_ROOT")
+    if env_path:
+        return Path(env_path).expanduser().resolve()
+    msg = "QASMBench root not provided; set QASMBENCH_ROOT or pass --qasm-root pointing to the dataset."
+    raise FileNotFoundError(msg)
+
+
+def discover_qasm_files(root: str | Path | None) -> list[Path]:
     """Recursively find ``.qasm`` files beneath ``root``.
 
     Raises:
         FileNotFoundError: when ``root`` does not exist or no files are found.
     """
-    root_path = Path(root).expanduser().resolve()
+    root_path = _resolve_root(root)
     if not root_path.exists():
         msg = f"QASMBench root not found: {root_path}"
         raise FileNotFoundError(msg)
@@ -46,41 +59,108 @@ def load_qasm_file(path: str | Path) -> QuantumCircuit:
         raise ValueError(msg) from exc
 
 
+def _stable_order(items: Iterable[QasmCircuit], seed: int) -> list[QasmCircuit]:
+    keyed = []
+    for circuit in items:
+        digest = hashlib.sha1(f"{circuit.path}:{seed}".encode()).hexdigest()
+        keyed.append((digest, circuit))
+    keyed.sort(key=lambda x: x[0])
+    return [c for _, c in keyed]
+
+
+def _limit_qubits(
+    circuit: QuantumCircuit, *, min_qubits: int | None, max_qubits: int | None
+) -> bool:
+    if min_qubits is not None and circuit.num_qubits < min_qubits:
+        return False
+    if max_qubits is not None and circuit.num_qubits > max_qubits:
+        return False
+    return True
+
+
+def load_qasmbench_tier(
+    root: str | Path | None,
+    tier: str,
+    *,
+    limit: int | None = None,
+    selection_seed: int = 0,
+    min_qubits: int | None = None,
+    max_qubits: int | None = None,
+) -> list[QasmCircuit]:
+    """Tiered loader that hashes paths + seed for deterministic selection."""
+    tier = tier.lower()
+    all_files = discover_qasm_files(root)
+    root_path = _resolve_root(root)
+
+    circuits: list[QasmCircuit] = []
+    for path in all_files:
+        qc = load_qasm_file(path)
+        if not _limit_qubits(qc, min_qubits=min_qubits, max_qubits=max_qubits):
+            continue
+        circuits.append(QasmCircuit(_circuit_id_for_path(path, root_path), path, qc))
+
+    ordered = _stable_order(circuits, selection_seed)
+    if limit is not None:
+        ordered = ordered[:limit]
+    return ordered
+
+
 def load_suite(
-    root: str | Path,
+    root: str | Path | None,
     suite: str = "dev",
     *,
     dev_limit: int = 20,
+    selection_seed: int = 0,
 ) -> list[QasmCircuit]:
     """Load a benchmark suite.
 
     Args:
-        root: Local path to QASMBench directory.
-        suite: Either ``\"dev\"`` (diverse ~20 circuits) or ``\"full\"`` (all).
+        root: Local path to QASMBench directory (or env var).
+        suite: Either ``dev`` (diverse ~20 circuits), ``full`` (all),
+            or tiered values (``small``, ``medium``, ``hard``).
         dev_limit: Maximum circuits for the dev suite.
+        selection_seed: Deterministic seed for subset ordering.
     """
-    all_files = discover_qasm_files(root)
-    root_path = Path(root).expanduser().resolve()
+    if suite in {"dev", "full"}:
+        all_files = discover_qasm_files(root)
+        root_path = _resolve_root(root)
+        if suite == "dev":
+            selected_paths = _select_diverse_subset(
+                all_files, root_path, limit=dev_limit, selection_seed=selection_seed
+            )
+        else:
+            selected_paths = all_files
+        return [
+            QasmCircuit(
+                circuit_id=_circuit_id_for_path(path, root_path),
+                path=path,
+                circuit=load_qasm_file(path),
+            )
+            for path in selected_paths
+        ]
 
-    if suite == "dev":
-        selected = _select_diverse_subset(all_files, root_path, limit=dev_limit)
-    elif suite == "full":
-        selected = all_files
-    else:
-        msg = f"Unknown suite '{suite}'. Expected 'dev' or 'full'."
+    tier_cfg = {
+        "small": {"max_qubits": 15, "limit": 40},
+        "medium": {"min_qubits": 8, "max_qubits": 25, "limit": 60},
+        "hard": {"min_qubits": 14, "max_qubits": 40, "limit": 80},
+    }
+    if suite not in tier_cfg:
+        msg = f"Unknown suite '{suite}'. Expected dev/full/small/medium/hard."
         raise ValueError(msg)
+    cfg = tier_cfg[suite]
+    return load_qasmbench_tier(
+        root,
+        tier=suite,
+        limit=cfg["limit"],
+        selection_seed=selection_seed,
+        min_qubits=cfg.get("min_qubits"),
+        max_qubits=cfg.get("max_qubits"),
+    )
 
-    return [
-        QasmCircuit(
-            circuit_id=_circuit_id_for_path(path, root_path),
-            path=path,
-            circuit=load_qasm_file(path),
-        )
-        for path in selected
-    ]
 
-
-def _select_diverse_subset(paths: Iterable[Path], root: Path, *, limit: int) -> list[Path]:
+def _select_diverse_subset(
+    paths: Iterable[Path], root: Path, *, limit: int, selection_seed: int
+) -> list[Path]:
     """Pick up to ``limit`` paths, round-robin across top-level folders."""
     buckets = _bucket_by_top_level(paths, root)
     ordered_keys = sorted(buckets)
@@ -94,7 +174,13 @@ def _select_diverse_subset(paths: Iterable[Path], root: Path, *, limit: int) -> 
                 selected.append(bucket.pop(0))
                 if len(selected) >= limit:
                     break
-    return selected
+    # Stable shuffle keyed by selection_seed for determinism.
+    keyed = []
+    for path in selected:
+        digest = hashlib.sha1(f"{path}:{selection_seed}".encode()).hexdigest()
+        keyed.append((digest, path))
+    keyed.sort(key=lambda x: x[0])
+    return [p for _, p in keyed]
 
 
 def _bucket_by_top_level(paths: Iterable[Path], root: Path) -> dict[str, list[Path]]:
@@ -116,11 +202,12 @@ def _circuit_id_for_path(path: Path, root: Path) -> str:
 
 
 def iter_qasm_circuits(
-    root: str | Path,
+    root: str | Path | None,
     suite: str = "dev",
     *,
     dev_limit: int = 20,
+    selection_seed: int = 0,
 ) -> Iterator[QasmCircuit]:
     """Yield circuits one-by-one (memory friendly wrapper over :func:`load_suite`)."""
-    for entry in load_suite(root, suite=suite, dev_limit=dev_limit):
+    for entry in load_suite(root, suite=suite, dev_limit=dev_limit, selection_seed=selection_seed):
         yield entry
