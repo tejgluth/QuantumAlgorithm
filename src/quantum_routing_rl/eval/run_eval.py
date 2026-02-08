@@ -16,7 +16,10 @@ from qiskit import __version__ as qiskit_version
 from qiskit.transpiler import CouplingMap
 
 from quantum_routing_rl.baselines.qiskit_baselines import (
+    run_basic_swap,
     run_best_available_sabre,
+    run_commuting_2q_router,
+    run_lookahead_swap,
     run_preset_opt3,
     run_qiskit_sabre_trials,
     run_sabre_layout_swap,
@@ -66,6 +69,8 @@ REQUIRED_COLUMNS = {
     "seed",
     "hardware_seed",
     "qiskit_version",
+    "baseline_status",
+    "fallback_used",
 }
 
 
@@ -561,22 +566,45 @@ def _result_record(
         "n_qubits": circuit.circuit.num_qubits,
         "graph_id": graph_id,
         "baseline_name": result.name,
-        "swaps_inserted": metrics.swaps,
-        "twoq_count": metrics.two_qubit_count,
-        "depth": metrics.depth,
-        "twoq_depth": metrics.two_qubit_depth,
         "routing_runtime_s": result.runtime_s,
-        "noise_proxy_score": metrics.success_prob,
-        "log_success_proxy": metrics.log_success_proxy,
-        "duration_proxy": metrics.duration_proxy,
-        "overall_log_success": metrics.overall_log_success,
-        "total_duration_ns": metrics.total_duration_ns,
-        "decoherence_penalty": metrics.decoherence_penalty,
         "seed": seed,
         "hardware_seed": hardware_seed,
         "hardware_profile": hardware_profile,
         "qiskit_version": qiskit_version,
+        "baseline_status": getattr(result, "baseline_status", "ok"),
+        "fallback_used": bool(getattr(result, "fallback_used", False)),
+        "fallback_reason": getattr(result, "fallback_reason", None),
     }
+    if metrics is None:
+        record.update(
+            {
+                "swaps_inserted": None,
+                "twoq_count": None,
+                "depth": None,
+                "twoq_depth": None,
+                "noise_proxy_score": None,
+                "log_success_proxy": None,
+                "duration_proxy": None,
+                "overall_log_success": None,
+                "total_duration_ns": None,
+                "decoherence_penalty": None,
+            }
+        )
+    else:
+        record.update(
+            {
+                "swaps_inserted": metrics.swaps,
+                "twoq_count": metrics.two_qubit_count,
+                "depth": metrics.depth,
+                "twoq_depth": metrics.two_qubit_depth,
+                "noise_proxy_score": metrics.success_prob,
+                "log_success_proxy": metrics.log_success_proxy,
+                "duration_proxy": metrics.duration_proxy,
+                "overall_log_success": metrics.overall_log_success,
+                "total_duration_ns": metrics.total_duration_ns,
+                "decoherence_penalty": metrics.decoherence_penalty,
+            }
+        )
     extra = getattr(result, "extra", {}) or {}
     record.update(extra)
     return record
@@ -761,6 +789,15 @@ def main(argv: list[str] | None = None) -> int:
                 for hw_seed, hw_model in hw_iter:
                     teacher_swaps = None
                     baselines = [
+                        run_basic_swap(
+                            circuit.circuit, coupling, seed=seed, hardware_model=hw_model
+                        ),
+                        run_lookahead_swap(
+                            circuit.circuit, coupling, seed=seed, hardware_model=hw_model
+                        ),
+                        run_commuting_2q_router(
+                            circuit.circuit, coupling, seed=seed, hardware_model=hw_model
+                        ),
                         run_sabre_layout_swap(
                             circuit.circuit, coupling, seed=seed, hardware_model=hw_model
                         ),
