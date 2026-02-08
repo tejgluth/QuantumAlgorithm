@@ -8,7 +8,7 @@ WEIGHTED_RESULTS_NAME?=$(if $(filter $(HARDWARE_DRAWS),10),results_noise_unguard
 WEIGHTED_SUMMARY_NAME?=$(if $(filter $(HARDWARE_DRAWS),10),summary_noise_unguarded_weighted.csv,summary_noise_unguarded_weighted_hd.csv)
 WEIGHTED_SUMMARY_STD_NAME?=$(if $(filter $(HARDWARE_DRAWS),10),summary_noise_unguarded_weighted_std.csv,summary_noise_unguarded_weighted_hd_std.csv)
 
-.PHONY: setup test lint format eval-small eval-pressure eval-full eval-noise eval-noise-unguarded eval-noise-unguarded-residual eval-noise-unguarded-weighted eval-teacher reproduce-paper validate-proxy validate-proxy-extended invariants eval-bestness audit
+.PHONY: setup test lint format eval-small eval-pressure eval-full eval-noise eval-noise-unguarded eval-noise-unguarded-residual eval-noise-unguarded-weighted eval-teacher reproduce-paper validate-proxy validate-proxy-extended invariants eval-bestness audit gauntlet gauntlet-small gauntlet-full gauntlet-industrial
 
 setup:
 	python3 -m venv $(VENV)
@@ -112,3 +112,20 @@ audit:
 	ARTIFACTS=$$ROOT $(MAKE) validate-proxy; \
 	ARTIFACTS=$$ROOT $(MAKE) eval-bestness; \
 	$(PY) -m quantum_routing_rl.eval.final_verdict --audit-root $$ROOT
+
+gauntlet-small:
+	$(MAKE) lint
+	$(MAKE) test
+	$(PY) -m quantum_routing_rl.eval.gauntlet --mode small --hardware-draws $(HARDWARE_DRAWS) --out $(ARTIFACTS)/gauntlet
+
+gauntlet-full:
+	$(MAKE) lint
+	$(MAKE) test
+	$(PY) -m quantum_routing_rl.eval.gauntlet --mode full --hardware-draws $(HARDWARE_DRAWS) --out $(ARTIFACTS)/gauntlet
+
+gauntlet-industrial:
+	$(MAKE) lint
+	$(MAKE) test
+	$(PY) -m quantum_routing_rl.eval.gauntlet --mode industrial --hardware-draws $(HARDWARE_DRAWS) --out $(ARTIFACTS)/gauntlet
+
+gauntlet: gauntlet-small invariants validate-proxy-extended
