@@ -21,6 +21,7 @@ def test_run_eval_emits_qiskit_trials_baseline(tmp_path):
         "--hardware-samples",
         "1",
         "--qiskit-trials",
+        "1",
         "2",
     ]
 
@@ -29,6 +30,7 @@ def test_run_eval_emits_qiskit_trials_baseline(tmp_path):
 
     df = pd.read_csv(out_dir / "results.csv")
     baselines = set(df["baseline_name"])
+    assert "qiskit_sabre_trials1" in baselines
     assert "qiskit_sabre_trials2" in baselines
     assert "qiskit_sabre_best" in baselines
     assert not (run_eval.REQUIRED_COLUMNS - set(df.columns))

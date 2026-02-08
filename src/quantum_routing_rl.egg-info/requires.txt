@@ -1,11 +1,20 @@
 qiskit>=1.0
+qiskit-aer>=0.13
+qiskit-ibm-runtime>=0.23
 numpy
 networkx
 pandas
 pyarrow
 matplotlib
 torch
+scipy
 
 [dev]
 pytest
 ruff
+
+[paper]
+numpy
+pandas
+matplotlib
+scipy

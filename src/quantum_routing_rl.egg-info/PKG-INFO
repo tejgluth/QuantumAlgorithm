@@ -2,13 +2,23 @@ Metadata-Version: 2.4
 Name: quantum-routing-rl
 Version: 0.1.0
 Requires-Python: >=3.11
+License-File: LICENSE
 Requires-Dist: qiskit>=1.0
+Requires-Dist: qiskit-aer>=0.13
+Requires-Dist: qiskit-ibm-runtime>=0.23
 Requires-Dist: numpy
 Requires-Dist: networkx
 Requires-Dist: pandas
 Requires-Dist: pyarrow
 Requires-Dist: matplotlib
 Requires-Dist: torch
+Requires-Dist: scipy
 Provides-Extra: dev
 Requires-Dist: pytest; extra == "dev"
 Requires-Dist: ruff; extra == "dev"
+Provides-Extra: paper
+Requires-Dist: numpy; extra == "paper"
+Requires-Dist: pandas; extra == "paper"
+Requires-Dist: matplotlib; extra == "paper"
+Requires-Dist: scipy; extra == "paper"
+Dynamic: license-file
