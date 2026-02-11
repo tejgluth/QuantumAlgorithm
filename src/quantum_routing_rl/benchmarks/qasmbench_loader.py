@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -94,7 +95,11 @@ def load_qasmbench_tier(
 
     circuits: list[QasmCircuit] = []
     for path in all_files:
-        qc = load_qasm_file(path)
+        try:
+            qc = load_qasm_file(path)
+        except ValueError as exc:  # pragma: no cover - defensive skip path
+            warnings.warn(f"[qasmbench] skipping invalid QASM {path}: {exc}")
+            continue
         if not _limit_qubits(qc, min_qubits=min_qubits, max_qubits=max_qubits):
             continue
         circuits.append(QasmCircuit(_circuit_id_for_path(path, root_path), path, qc))
@@ -124,20 +129,47 @@ def load_suite(
     if suite in {"dev", "full"}:
         all_files = discover_qasm_files(root)
         root_path = _resolve_root(root)
+
+        def _hash_key(path: Path) -> str:
+            return hashlib.sha1(f"{path}:{selection_seed}".encode()).hexdigest()
+
         if suite == "dev":
             selected_paths = _select_diverse_subset(
                 all_files, root_path, limit=dev_limit, selection_seed=selection_seed
             )
         else:
             selected_paths = all_files
-        return [
-            QasmCircuit(
-                circuit_id=_circuit_id_for_path(path, root_path),
-                path=path,
-                circuit=load_qasm_file(path),
+        circuits: list[QasmCircuit] = []
+        fallback_paths: list[Path] = []
+        if suite == "dev":
+            fallback_paths = sorted(
+                [p for p in all_files if p not in selected_paths], key=_hash_key
             )
-            for path in selected_paths
-        ]
+
+        def _try_add(path: Path) -> None:
+            try:
+                circuit = load_qasm_file(path)
+            except ValueError as exc:  # pragma: no cover - defensive skip path
+                warnings.warn(f"[qasmbench] skipping invalid QASM {path}: {exc}")
+                return
+            circuits.append(
+                QasmCircuit(
+                    circuit_id=_circuit_id_for_path(path, root_path),
+                    path=path,
+                    circuit=circuit,
+                )
+            )
+
+        for path in selected_paths:
+            _try_add(path)
+            if suite == "dev" and len(circuits) >= dev_limit:
+                break
+        if suite == "dev" and len(circuits) < dev_limit:
+            for path in fallback_paths:
+                _try_add(path)
+                if len(circuits) >= dev_limit:
+                    break
+        return circuits
 
     tier_cfg = {
         "small": {"max_qubits": 15, "limit": 40},
