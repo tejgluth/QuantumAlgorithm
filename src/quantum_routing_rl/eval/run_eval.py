@@ -16,6 +16,7 @@ from qiskit import __version__ as qiskit_version
 from qiskit.transpiler import CouplingMap
 
 from quantum_routing_rl.baselines.qiskit_baselines import (
+    BaselineResult,
     run_basic_swap,
     run_best_available_sabre,
     run_commuting_2q_router,
@@ -50,6 +51,7 @@ from quantum_routing_rl.models.weighted_sabre import (
 )
 from quantum_routing_rl.env.routing_env import RoutingEnvConfig
 from quantum_routing_rl.hardware.model import HardwareModel
+from quantum_routing_rl.routing.normalize_circuit import normalize_for_routing
 
 REQUIRED_COLUMNS = {
     "n_qubits",
@@ -71,6 +73,7 @@ REQUIRED_COLUMNS = {
     "qiskit_version",
     "baseline_status",
     "fallback_used",
+    "skip_reason",
 }
 
 
@@ -574,6 +577,7 @@ def _result_record(
         "baseline_status": getattr(result, "baseline_status", "ok"),
         "fallback_used": bool(getattr(result, "fallback_used", False)),
         "fallback_reason": getattr(result, "fallback_reason", None),
+        "skip_reason": getattr(result, "skip_reason", None),
     }
     if metrics is None:
         record.update(
@@ -624,7 +628,18 @@ def _write_summary(df: pd.DataFrame, mean_path: Path, std_path: Path | None = No
         "total_duration_ns",
         "decoherence_penalty",
     ]
-    agg = df.groupby(["graph_id", "baseline_name"]).agg({m: ["mean", "std"] for m in metrics})
+    use_df = df[df["baseline_status"] != "SKIPPED"] if "baseline_status" in df else df
+    if use_df.empty:
+        empty_cols = ["graph_id", "baseline_name"] + [f"{m}_mean" for m in metrics]
+        mean_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(columns=empty_cols).to_csv(mean_path, index=False)
+        if std_path is not None:
+            std_cols = ["graph_id", "baseline_name"] + [f"{m}_std" for m in metrics]
+            std_path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(columns=std_cols).to_csv(std_path, index=False)
+        return
+
+    agg = use_df.groupby(["graph_id", "baseline_name"]).agg({m: ["mean", "std"] for m in metrics})
 
     def _stat_df(stat: str) -> pd.DataFrame:
         sub = agg.xs(stat, level=1, axis=1)
@@ -779,6 +794,14 @@ def main(argv: list[str] | None = None) -> int:
 
     records: list[dict[str, object]] = []
     for circuit in circuits:
+        norm_circuit, norm_meta = normalize_for_routing(circuit.circuit)
+        norm_extra = {
+            "normalized": norm_meta.get("normalized", False),
+            "normalization_iters": norm_meta.get("iters", 0),
+            "remaining_multiq": norm_meta.get("remaining_multiq", 0),
+            "remaining_ops": "|".join(norm_meta.get("remaining_ops", [])),
+            "normalization_skip_reason": norm_meta.get("skipped_reason"),
+        }
         applicable_maps = list(_filter_coupling_maps(coupling_maps, circuit))
         if not applicable_maps:
             continue
@@ -787,28 +810,72 @@ def main(argv: list[str] | None = None) -> int:
                 hw_list = hardware_models.get(graph_id, [])
                 hw_iter = list(zip(hardware_seeds, hw_list)) if hw_list else [(None, None)]
                 for hw_seed, hw_model in hw_iter:
+                    if norm_meta.get("remaining_multiq", 0) > 0:
+                        baseline_names: list[str] = [
+                            "qiskit_basic_swap",
+                            "qiskit_lookahead_swap",
+                            "qiskit_commuting_2q_router",
+                            "sabre_layout_swap",
+                            "qiskit_sabre_best",
+                        ]
+                        if args.run_preset_opt3:
+                            baseline_names.append("qiskit_preset_opt3")
+                        baseline_names.extend(
+                            [f"qiskit_sabre_trials{t}" for t in qiskit_trial_budgets]
+                        )
+                        if args.include_teacher:
+                            baseline_names.append("teacher_sabre_like")
+                        if args.run_weighted_sabre and hw_model is not None:
+                            baseline_names.append("weighted_sabre")
+                        if il_model is not None:
+                            baseline_names.append(il_name)
+                        if residual_model is not None:
+                            baseline_names.append(residual_name)
+
+                        for bname in baseline_names:
+                            skip_result = BaselineResult(
+                                bname,
+                                circuit=None,
+                                metrics=None,
+                                runtime_s=0.0,
+                                seed=seed,
+                                baseline_status="SKIPPED",
+                                skip_reason=norm_meta.get("skipped_reason"),
+                                extra=dict(norm_extra),
+                            )
+                            records.append(
+                                _result_record(
+                                    circuit,
+                                    graph_id,
+                                    skip_result,
+                                    seed=seed,
+                                    suite=suite_label,
+                                    hardware_seed=hw_seed,
+                                    hardware_profile=args.hardware_profile,
+                                )
+                            )
+                        continue
+
                     teacher_swaps = None
                     baselines = [
-                        run_basic_swap(
-                            circuit.circuit, coupling, seed=seed, hardware_model=hw_model
-                        ),
+                        run_basic_swap(norm_circuit, coupling, seed=seed, hardware_model=hw_model),
                         run_lookahead_swap(
-                            circuit.circuit, coupling, seed=seed, hardware_model=hw_model
+                            norm_circuit, coupling, seed=seed, hardware_model=hw_model
                         ),
                         run_commuting_2q_router(
-                            circuit.circuit, coupling, seed=seed, hardware_model=hw_model
+                            norm_circuit, coupling, seed=seed, hardware_model=hw_model
                         ),
                         run_sabre_layout_swap(
-                            circuit.circuit, coupling, seed=seed, hardware_model=hw_model
+                            norm_circuit, coupling, seed=seed, hardware_model=hw_model
                         ),
                         run_best_available_sabre(
-                            circuit.circuit, coupling, seed=seed, hardware_model=hw_model
+                            norm_circuit, coupling, seed=seed, hardware_model=hw_model
                         ),
                     ]
                     if args.run_preset_opt3:
                         baselines.append(
                             run_preset_opt3(
-                                circuit.circuit,
+                                norm_circuit,
                                 coupling,
                                 seed=seed,
                                 hardware_model=hw_model,
@@ -817,7 +884,7 @@ def main(argv: list[str] | None = None) -> int:
                     for trials in qiskit_trial_budgets:
                         baselines.append(
                             run_qiskit_sabre_trials(
-                                circuit.circuit,
+                                norm_circuit,
                                 coupling,
                                 seed=seed,
                                 trials=trials,
@@ -838,7 +905,7 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     if args.include_teacher:
                         teacher_result = route_with_teacher(
-                            circuit.circuit,
+                            norm_circuit,
                             coupling,
                             name="teacher_sabre_like",
                             seed=seed,
@@ -864,7 +931,7 @@ def main(argv: list[str] | None = None) -> int:
                         else:
                             try:
                                 weighted_result = route_with_weighted_sabre(
-                                    circuit.circuit,
+                                    norm_circuit,
                                     coupling,
                                     hardware_model=hw_model,
                                     seed=seed,
@@ -894,7 +961,7 @@ def main(argv: list[str] | None = None) -> int:
                         try:
                             il_result = route_with_policy(
                                 il_model,
-                                circuit.circuit,
+                                norm_circuit,
                                 coupling,
                                 name=il_name,
                                 seed=seed,
@@ -925,7 +992,7 @@ def main(argv: list[str] | None = None) -> int:
                             if args.residual_multistep:
                                 residual_result = route_with_multistep_residual(
                                     residual_model,
-                                    circuit.circuit,
+                                    norm_circuit,
                                     coupling,
                                     name=residual_name,
                                     seed=seed,
@@ -934,7 +1001,7 @@ def main(argv: list[str] | None = None) -> int:
                             else:
                                 residual_result = route_with_residual_policy(
                                     residual_model,
-                                    circuit.circuit,
+                                    norm_circuit,
                                     coupling,
                                     name=residual_name,
                                     seed=seed,

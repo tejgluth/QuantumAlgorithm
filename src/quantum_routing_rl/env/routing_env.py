@@ -180,6 +180,10 @@ class RoutingEnv:
         assert self._routed is not None
         while self._inst_ptr < len(self._circuit.data):
             inst: CircuitInstruction = self._circuit.data[self._inst_ptr]
+            if inst.operation.name == "barrier":
+                self._append_mapped(inst)
+                self._inst_ptr += 1
+                continue
             if inst.operation.num_qubits == 1:
                 self._append_mapped(inst)
                 self._inst_ptr += 1

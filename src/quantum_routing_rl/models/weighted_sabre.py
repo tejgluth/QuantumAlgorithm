@@ -18,6 +18,7 @@ from quantum_routing_rl.env.state import LogicalGate, RoutingState
 from quantum_routing_rl.eval.metrics import assert_coupling_compatible, compute_metrics
 from quantum_routing_rl.hardware.model import HardwareModel
 from quantum_routing_rl.models.teacher import _normalize_edges, _sabre_initial_layout
+from quantum_routing_rl.routing.normalize_circuit import normalize_for_routing
 from quantum_routing_rl.routing.weighted_distance import (
     WeightedDistanceCache,
     WeightedDistanceParams,
@@ -213,6 +214,25 @@ def route_with_weighted_sabre(
         msg = "hardware_model is required for weighted SABRE routing."
         raise ValueError(msg)
 
+    circuit, norm_meta = normalize_for_routing(circuit)
+    norm_extra = {
+        "normalized": norm_meta.get("normalized", False),
+        "normalization_iters": norm_meta.get("iters", 0),
+        "remaining_multiq": norm_meta.get("remaining_multiq", 0),
+        "remaining_ops": "|".join(norm_meta.get("remaining_ops", [])),
+    }
+    if norm_meta.get("remaining_multiq", 0) > 0:
+        return BaselineResult(
+            name="weighted_sabre",
+            circuit=None,
+            metrics=None,
+            runtime_s=0.0,
+            seed=seed,
+            baseline_status="SKIPPED",
+            skip_reason=norm_meta.get("skipped_reason"),
+            extra=norm_extra,
+        )
+
     env_cfg = env_config or RoutingEnvConfig(frontier_size=4)
     base_layout = _sabre_initial_layout(circuit, coupling_map, seed=seed)
     rng = random.Random(seed)
@@ -274,6 +294,7 @@ def route_with_weighted_sabre(
             runtime_s=runtime,
             seed=trial_seed,
             extra={
+                **norm_extra,
                 "trial": trial,
                 "trials_total": max(1, trials),
                 "alpha_time": (distance_params.alpha_time if distance_params else 0.0),

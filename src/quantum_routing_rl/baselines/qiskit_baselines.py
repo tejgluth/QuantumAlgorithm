@@ -17,6 +17,7 @@ from quantum_routing_rl.eval.metrics import (
     assert_coupling_compatible,
     compute_metrics,
 )
+from quantum_routing_rl.routing.normalize_circuit import normalize_for_routing
 
 
 @dataclass
@@ -31,6 +32,7 @@ class BaselineResult:
     baseline_status: str = "ok"
     fallback_used: bool = False
     fallback_reason: str | None = None
+    skip_reason: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def as_record(self) -> dict[str, Any]:
@@ -44,6 +46,8 @@ class BaselineResult:
         }
         if self.fallback_reason:
             record["fallback_reason"] = self.fallback_reason
+        if self.skip_reason:
+            record["skip_reason"] = self.skip_reason
         if self.metrics is not None:
             record.update(self.metrics.as_dict())
         record.update(self.extra)
@@ -128,6 +132,24 @@ def run_commuting_2q_router(
 ) -> BaselineResult:
     """Commuting2qGateRouter baseline (best-effort)."""
     name = "qiskit_commuting_2q_router"
+    circuit, norm_meta = normalize_for_routing(circuit)
+    norm_extra = {
+        "normalized": norm_meta.get("normalized", False),
+        "normalization_iters": norm_meta.get("iters", 0),
+        "remaining_multiq": norm_meta.get("remaining_multiq", 0),
+        "remaining_ops": "|".join(norm_meta.get("remaining_ops", [])),
+    }
+    if norm_meta.get("remaining_multiq", 0) > 0:
+        return BaselineResult(
+            name,
+            circuit=None,
+            metrics=None,
+            runtime_s=0.0,
+            seed=seed,
+            baseline_status="SKIPPED",
+            skip_reason=norm_meta.get("skipped_reason"),
+            extra=norm_extra,
+        )
     try:
         from qiskit.transpiler.passes import Commuting2qBlock, Commuting2qGateRouter
         from qiskit.transpiler import PassManager
@@ -154,6 +176,7 @@ def run_commuting_2q_router(
             hardware_model=hardware_model,
             baseline_status="not_applicable",
             fallback_reason="no_two_qubit_gates",
+            extra=norm_extra,
         )
 
     pm = PassManager([Commuting2qBlock(), Commuting2qGateRouter(coupling_map=coupling_map)])
@@ -171,8 +194,10 @@ def run_commuting_2q_router(
             hardware_model=hardware_model,
             baseline_status="failed",
             fallback_reason=str(exc),
+            extra=norm_extra,
         )
     runtime = time.perf_counter() - start
+    norm_extra["pass_manager"] = "Commuting2qGateRouter"
     return _finalize_result(
         name,
         routed,
@@ -180,7 +205,7 @@ def run_commuting_2q_router(
         runtime=runtime,
         seed=seed,
         hardware_model=hardware_model,
-        extra={"pass_manager": "Commuting2qGateRouter"},
+        extra=norm_extra,
     )
 
 
@@ -308,6 +333,25 @@ def _run_baseline(
     fallback_reason: str | None = None,
     baseline_status: str = "ok",
 ) -> BaselineResult:
+    circuit, norm_meta = normalize_for_routing(circuit)
+    norm_extra = {
+        "normalized": norm_meta.get("normalized", False),
+        "normalization_iters": norm_meta.get("iters", 0),
+        "remaining_multiq": norm_meta.get("remaining_multiq", 0),
+        "remaining_ops": "|".join(norm_meta.get("remaining_ops", [])),
+    }
+    if norm_meta.get("remaining_multiq", 0) > 0:
+        return BaselineResult(
+            name,
+            circuit=None,
+            metrics=None,
+            runtime_s=0.0,
+            seed=transpile_opts.get("seed_transpiler"),
+            baseline_status="SKIPPED",
+            skip_reason=norm_meta.get("skipped_reason"),
+            extra=norm_extra,
+        )
+
     fallback_used = False
     start = time.perf_counter()
     routed: QuantumCircuit | None = None
@@ -332,7 +376,8 @@ def _run_baseline(
                 baseline_status="failed",
                 fallback_used=True,
                 fallback_reason=str(exc2),
-                extra={},
+                skip_reason=None,
+                extra=dict(norm_extra),
             )
     runtime = time.perf_counter() - start
 
@@ -341,6 +386,7 @@ def _run_baseline(
         for k, v in transpile_opts.items()
         if k not in {"seed_transpiler", "coupling_map"} and v is not None
     }
+    extra.update(norm_extra)
     return _finalize_result(
         name,
         routed,
@@ -351,6 +397,7 @@ def _run_baseline(
         baseline_status=baseline_status,
         fallback_used=fallback_used,
         fallback_reason=fallback_reason,
+        skip_reason=None,
         extra=extra,
     )
 
@@ -364,6 +411,25 @@ def _run_pass_manager(
     seed: int | None = None,
     hardware_model=None,
 ) -> BaselineResult:
+    circuit, norm_meta = normalize_for_routing(circuit)
+    norm_extra = {
+        "normalized": norm_meta.get("normalized", False),
+        "normalization_iters": norm_meta.get("iters", 0),
+        "remaining_multiq": norm_meta.get("remaining_multiq", 0),
+        "remaining_ops": "|".join(norm_meta.get("remaining_ops", [])),
+    }
+    if norm_meta.get("remaining_multiq", 0) > 0:
+        return BaselineResult(
+            name,
+            circuit=None,
+            metrics=None,
+            runtime_s=0.0,
+            seed=seed,
+            baseline_status="SKIPPED",
+            skip_reason=norm_meta.get("skipped_reason"),
+            extra=norm_extra,
+        )
+
     start = time.perf_counter()
     try:
         routed = pass_manager.run(circuit)
@@ -378,9 +444,12 @@ def _run_pass_manager(
             hardware_model=hardware_model,
             baseline_status="failed",
             fallback_reason=str(exc),
+            skip_reason=None,
+            extra=dict(norm_extra),
         )
     runtime = time.perf_counter() - start
     extra = {"pass_manager": pass_manager.__class__.__name__}
+    extra.update(norm_extra)
     return _finalize_result(
         name,
         routed,
@@ -388,6 +457,7 @@ def _run_pass_manager(
         runtime=runtime,
         seed=seed,
         hardware_model=hardware_model,
+        skip_reason=None,
         extra=extra,
     )
 
@@ -403,6 +473,7 @@ def _finalize_result(
     baseline_status: str = "ok",
     fallback_used: bool = False,
     fallback_reason: str | None = None,
+    skip_reason: str | None = None,
     extra: dict[str, Any] | None = None,
 ) -> BaselineResult:
     cmap_edges: list[tuple[int, int]] | None = None
@@ -430,6 +501,7 @@ def _finalize_result(
         baseline_status=status,
         fallback_used=fallback_used,
         fallback_reason=fallback_reason,
+        skip_reason=skip_reason,
         extra=merged_extra,
     )
 

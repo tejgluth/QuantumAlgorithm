@@ -46,6 +46,7 @@ src/quantum_routing_rl/models/weighted_sabre.py
 src/quantum_routing_rl/qiskit_pass/__init__.py
 src/quantum_routing_rl/qiskit_pass/learned_swap_router.py
 src/quantum_routing_rl/routing/__init__.py
+src/quantum_routing_rl/routing/normalize_circuit.py
 src/quantum_routing_rl/routing/weighted_distance.py
 tests/test_action_masking.py
 tests/test_determinism.py
@@ -55,6 +56,7 @@ tests/test_il.py
 tests/test_invariants.py
 tests/test_metrics.py
 tests/test_multistep_residual.py
+tests/test_normalize_circuit.py
 tests/test_paired_deltas.py
 tests/test_proxy_validation.py
 tests/test_qasmbench_loader.py
