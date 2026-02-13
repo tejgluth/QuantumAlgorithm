@@ -1,6 +1,5 @@
-VENV?=.venv
-PY?=$(VENV)/bin/python
-PIP?=$(VENV)/bin/pip
+PYTHON?=python3
+PY?=$(PYTHON)
 ARTIFACTS?=artifacts
 SKIP_RL?=0
 HARDWARE_DRAWS?=10
@@ -11,10 +10,7 @@ WEIGHTED_SUMMARY_STD_NAME?=$(if $(filter $(HARDWARE_DRAWS),10),summary_noise_ung
 .PHONY: setup test lint format eval-small eval-pressure eval-full eval-noise eval-noise-unguarded eval-noise-unguarded-residual eval-noise-unguarded-weighted eval-teacher reproduce-paper validate-proxy validate-proxy-extended invariants eval-bestness audit gauntlet gauntlet-small gauntlet-full gauntlet-industrial
 
 setup:
-	python3 -m venv $(VENV)
-	$(PIP) install -U pip
-	$(PIP) install -e "[dev]" || true
-	$(PIP) install -e ".[dev]"
+	$(PYTHON) scripts/bootstrap.py --dev
 
 test:
 	$(PY) -m pytest -q

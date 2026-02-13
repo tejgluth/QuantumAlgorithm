@@ -1,54 +1,63 @@
 # quantum-routing-rl
 
-Noise-aware quantum circuit routing with a production-ready **Weighted SABRE** baseline and a reproducible gauntlet harness.
+Noise-aware quantum circuit routing with the **Weighted SABRE** baseline, a reproducible gauntlet harness, and a FINAL_VERDICT pipeline that can run on Ubuntu, macOS, or Windows (best effort on Windows).
 
-## What’s included
+## What you get
 - Weighted SABRE router with hardware-aware distances and multi-trial selection.
-- Fair Qiskit baselines (BasicSwap, LookaheadSwap, SABRE best-of-N, preset opt3) plus optional external adapters.
-- Benchmark suites (gauntlet small/full/industrial) spanning QASMBench tiers, structured hard synthetics, and richer topologies (heavy-hex, grid_5x5, sparse_32).
-- Validation tools: Aer proxy cross-check (`proxy_validation_extended`) and invariant checks (`invariants`).
+- Fair Qiskit baselines (SABRE best-of-N, preset opt3) plus deterministic invariant checks.
+- Gauntlet suites (small/full/industrial) spanning QASMBench and structured hard cases.
+- Validation tools: Aer proxy cross-check (`proxy_validation_extended`) and verdict assembly.
 
-## Quickstart
-1) `make setup`  
-2) `make lint` && `make test`  
-3) `make gauntlet-small HARDWARE_DRAWS=10` (writes to `artifacts/gauntlet/<timestamp>/`)  
-4) `make validate-proxy-extended` and `make invariants` to sanity-check the proxy and outputs.
+## Quick start (all OS)
+- Ubuntu / macOS
+  - `python3 scripts/bootstrap.py --dev`
+  - `python3 scripts/run.py test`
+- Windows (PowerShell)
+  - `py -3 scripts\bootstrap.py --dev`
+  - `py -3 scripts\run.py test`
 
-Gauntlet entrypoints live in `src/quantum_routing_rl/eval/gauntlet.py` and reuse the core harness in `eval/run_eval.py`.
+`bootstrap.py` creates `.venv` by default (override with `QRRL_VENV_DIR`) and installs qiskit **and** qiskit-aer plus dev tools. No sudo required. `scripts/run.py` keeps the same interpreter so you never depend on `bin/` vs `Scripts/` paths.
 
-## Minimal API
-```python
-from qiskit.transpiler import CouplingMap
-from quantum_routing_rl import (
-    route_with_weighted_sabre,
-    WeightedDistanceParams,
-    WeightedSabreWeights,
-)
-from quantum_routing_rl.hardware.model import HardwareModel
+## Run the gauntlet (CPU path)
+- `HARDWARE_DRAWS=10 python3 scripts/run.py gauntlet-small`
+- Results land in `artifacts/gauntlet/<timestamp>/`. The combined CSV is `results_gauntlet_small.csv` with a matching summary.
+- Optional checks:
+  - `python3 scripts/run.py invariants`
+  - `python3 scripts/run.py validate-proxy-extended --include-weighted`
+  - `python3 scripts/run.py verdict`
 
-cmap = CouplingMap([[0, 1], [1, 2]])
-hardware = HardwareModel.synthetic(cmap.graph, seed=7, profile="realistic")
-params = WeightedDistanceParams(alpha_time=0.5, beta_xtalk=0.2)
-weights = WeightedSabreWeights(lookahead_weight=0.5, decay_weight=0.25, stagnation_weight=0.25, decay_factor=0.9)
+## Ubuntu + CUDA route
+1) `python3 scripts/bootstrap.py --dev --cuda --aer-gpu`
+2) `HARDWARE_DRAWS=50 python3 scripts/run.py gauntlet-small`
+3) Proceed to the mega command in the **Final one-liner** section (runs full + industrial tiers plus validations).
 
-result = route_with_weighted_sabre(
-    circuit,
-    cmap,
-    hardware_model=hardware,
-    trials=8,
-    distance_params=params,
-    snapshot_mode="avg",
-    router_weights=weights,
-)
-print(result.metrics.overall_log_success)
+`--cuda` is best-effort: it tries the stock torch, then CUDA wheels (cu121 → cu118) if `nvidia-smi` is present. `--aer-gpu` is attempted only when CUDA torch is detected.
+
+## Reproduce the paper / verdict story
+1) Run the gauntlet tier you need (recommended: full):
+   - `HARDWARE_DRAWS=50 python3 scripts/run.py gauntlet-full`
+2) Run invariants on the latest gauntlet results (auto-detected):
+   - `python3 scripts/run.py invariants`
+3) Validate the noise proxy against Aer:
+   - `python3 scripts/run.py validate-proxy-extended --include-weighted`
+4) Assemble the final claim:
+   - `python3 scripts/run.py verdict`
+
+Artifacts live under `artifacts/gauntlet/<timestamp>/` with a copy of `FINAL_VERDICT.md` at `artifacts/FINAL_VERDICT.md`. Gauntlet results/summary filenames include the tier (small/full/industrial).
+
+## Troubleshooting
+- Missing venv or wrong interpreter: rerun `python3 scripts/bootstrap.py --dev --venv .venv_alt` and call `scripts/run.py` with the same python.
+- Aer not installed: `python3 -m pip install -U qiskit-aer` (bootstrap already includes it).
+- Ruff missing: rerun bootstrap with `--dev` or `python3 -m pip install -U ruff`.
+- Torch shows CPU only: ensure `nvidia-smi` exists, rerun `python3 scripts/bootstrap.py --cuda`, then `python3 scripts/doctor.py` to confirm.
+- Windows path quirks: never call `.venv/bin/python`; always invoke `python scripts/run.py ...` or `py -3 scripts\run.py ...`.
+
+## Final one-liner (Ubuntu + CUDA)
+Run everything (bootstrap + gauntlet full + industrial + validations) in one pasteable command:
+
+```bash
+HARDWARE_DRAWS=200 python3 scripts/bootstrap.py --dev --cuda --aer-gpu && HARDWARE_DRAWS=200 python3 scripts/run.py gauntlet-full && HARDWARE_DRAWS=200 python3 scripts/run.py gauntlet-industrial && python3 scripts/run.py invariants && python3 scripts/run.py validate-proxy-extended --include-weighted && python3 scripts/run.py verdict
 ```
 
 ## Legacy experiments
-IL/RL/residual exploration is retained only for reference under `experiments/legacy_rl/` and is **not** part of the gauntlet story or default exports.
-
-## Contributing
-- `make lint` / `make test` before PRs.
-- Keep artifacts reproducible; never fabricate results or hide fallbacks (see `invariants` target).
-
-## License & citation
-Apache-2.0. Cite via `CITATION.cff`.
+IL/RL/residual work remains under `experiments/legacy_rl/` for reference only. The main story is **Weighted SABRE + gauntlet + verdict**.

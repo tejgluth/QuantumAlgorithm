@@ -1,6 +1,6 @@
 # Reproducibility Checklist
 
-This project is designed to regenerate the paper-ready artifacts deterministically on a single host. All commands assume the repository root and a populated `.venv` (run `make setup` once).
+This project is designed to regenerate the paper-ready artifacts deterministically on a single host. Run `python3 scripts/bootstrap.py --dev` once (or `py -3 scripts\\bootstrap.py --dev` on Windows) and keep using the same interpreter for `scripts/run.py` commands.
 
 ## Hardware Model and Noise Assumptions
 - **Coupling graphs:** `ring_8`, `grid_3x3`, `heavy_hex_15`.
@@ -18,29 +18,22 @@ This project is designed to regenerate the paper-ready artifacts deterministical
 ## Hardware Draw Generation
 Calibration snapshots are generated on the fly inside `run_eval` by calling `HardwareModel.synthetic(graph, seed=hardware_seed, ...)` for each hardware seed and graph. Drifted snapshot `t1/t2` and CNOT parameters are produced by the deterministic `_drift_*` helpers using `seed + snapshot_index`, so the full draw set is reproducible from the seed tuple `(graph_id, hardware_seed)`.
 
-## Commands to Regenerate Figures and Tables
-The single entry point is:
+## Commands to regenerate the gauntlet + verdict story
+Recommended flow (CPU or GPU):
 
 ```bash
-make reproduce-paper
+HARDWARE_DRAWS=50 python3 scripts/run.py gauntlet-full
+python3 scripts/run.py invariants
+python3 scripts/run.py validate-proxy-extended --include-weighted
+python3 scripts/run.py verdict
 ```
 
-This performs (skipping reruns when outputs already exist):
-- Weighted SABRE pressure evaluation with noise/drift (`results_noise_unguarded_weighted_hd.csv`, `summary_noise_unguarded_weighted_hd.csv`) including the fair multi-trial baseline `qiskit_sabre_trials8`.
-- Paired deltas + Wilcoxon + effect sizes (`artifacts/deltas/`, `artifacts/statistics/`).
-- Variance breakdown (`artifacts/variance/variance_breakdown.csv`).
-- Ablation sweep A0–A3 (`artifacts/summary_ablation*.csv`).
-- Yield vs overhead points (`artifacts/plots_yield_overhead/`).
-- Paper-ready tables (`artifacts/tables/`) and plots (`artifacts/plots_final/Fig*.png|pdf`).
+- Gauntlet results land under `artifacts/gauntlet/<timestamp>/` with `results_gauntlet_full.csv` and `summary_gauntlet_full.csv`.
+- Invariants are written next to the results in `invariants/`.
+- Proxy validation artifacts are placed in `proxy_validation_extended/` under the same gauntlet run.
+- `FINAL_VERDICT.md` is written inside the gauntlet run and copied to `artifacts/FINAL_VERDICT.md`.
 
-Expected runtime: dominated by the 50-draw pressure evaluation (~25k routed circuits; per-circuit routing runtime averages <3 ms in `summary_noise_unguarded_weighted_hd.csv`). On an Apple silicon laptop this completes within a few minutes; budget ~10 minutes to be safe.
-
-### Outputs by Artifact
-- **Main results table & figure:** `artifacts/tables/main_results.{csv,tex}`, `artifacts/plots_final/Fig1_MainResults.{png,pdf}`.
-- **Paired delta histogram + stats:** `artifacts/plots_final/Fig2_PairedDeltas.{png,pdf}`, `artifacts/statistics/significance.csv`, `effect_size.csv`.
-- **Yield vs overhead:** `artifacts/plots_final/Fig3_YieldVsOverhead.{png,pdf}`.
-- **Ablation:** `artifacts/tables/ablation.{csv,tex}`, `artifacts/plots_final/Fig4_Ablation.{png,pdf}`.
-- **Variance attribution:** `artifacts/tables/variance.{csv,tex}`, `artifacts/plots_final/Fig5_VarianceBreakdown.{png,pdf}`.
+For legacy paper figures/tables, `make reproduce-paper` still works on systems with `make` available; it reuses the same seeds and noise settings but remains optional to the main gauntlet storyline.
 
 ## Version Pinning (recorded in `artifacts/metadata.json`)
 - Python: 3.12.10

@@ -3,13 +3,12 @@
 Thanks for helping improve `quantum-routing-rl`! Please keep the scope focused on routing quality, evaluation, and reproducibility.
 
 ## Setup
-- Create a virtual environment: `python3 -m venv .venv && .venv/bin/pip install -U pip`
-- Install in editable mode: `.venv/bin/pip install -e .[dev]`
-- Style and tests: `make lint` then `make test`
+- `python3 scripts/bootstrap.py --dev` (uses `.venv` by default; override with `QRRL_VENV_DIR`)
+- Style and tests: `python3 scripts/run.py lint` then `python3 scripts/run.py test`
 
 ## Workflow
 - Prefer small, test-backed changes. Avoid regenerating large artifacts unless necessary.
-- Use the provided make targets: `make eval-small`, `make eval-noise-unguarded-weighted`, `make reproduce-paper`.
+- Prefer the Python runner: `python3 scripts/run.py gauntlet-small` or `gauntlet-full`; Make remains optional.
 - New routing baselines should integrate through `src/quantum_routing_rl/eval/run_eval.py` and log metrics via `_result_record`.
 - When adding benchmarks, document the source dataset and update `REPRODUCIBILITY.md` with seeds and commands.
 

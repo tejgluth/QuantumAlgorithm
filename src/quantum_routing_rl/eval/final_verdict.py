@@ -30,6 +30,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional override for proxy_validation/correlations.csv",
     )
     parser.add_argument(
+        "--delta-correlations",
+        type=Path,
+        help="Optional override for proxy_validation/delta_correlations.csv",
+    )
+    parser.add_argument(
         "--out",
         type=Path,
         help="Path to write FINAL_VERDICT.md (defaults to audit_root/FINAL_VERDICT.md).",
@@ -41,7 +46,10 @@ def _load(path: Path, description: str) -> pd.DataFrame:
     if not path.exists():
         msg = f"Missing required artifact: {description} at {path}"
         raise FileNotFoundError(msg)
-    return pd.read_csv(path)
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
 
 
 def _metric(df: pd.DataFrame, baseline: str, metric: str) -> float | None:
@@ -168,23 +176,47 @@ def _write_verdict(
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     root = args.audit_root.expanduser()
-    bestness_path = args.bestness_summary or root / "summary_bestness.csv"
-    weighted_path = args.weighted_summary
-    if weighted_path is None:
-        # prefer hardware-draws=50 file if present, otherwise fallback to default.
-        hd = root / "summary_noise_unguarded_weighted_hd.csv"
-        default = root / "summary_noise_unguarded_weighted.csv"
-        weighted_path = hd if hd.exists() else default
-    proxy_corr_path = args.proxy_correlations or root / "proxy_validation" / "correlations.csv"
-    delta_corr_path = root / "proxy_validation" / "delta_correlations.csv"
+    summary_candidates = [
+        root / "summary_gauntlet_full.csv",
+        root / "summary_gauntlet_industrial.csv",
+        root / "summary_gauntlet_small.csv",
+        root / "summary.csv",
+        root / "summary_bestness.csv",
+    ]
+    bestness_path = args.bestness_summary
+    if bestness_path is None:
+        for path in summary_candidates:
+            if path.exists():
+                bestness_path = path
+                break
+    if bestness_path is None:
+        bestness_path = root / "summary_bestness.csv"
+
+    weighted_path = args.weighted_summary or bestness_path
+
+    proxy_dirs = [root / "proxy_validation", root / "proxy_validation_extended"]
+    proxy_corr_path = args.proxy_correlations
+    delta_corr_path = args.delta_correlations
+    if proxy_corr_path is None:
+        for d in proxy_dirs:
+            candidate = d / "correlations.csv"
+            if candidate.exists():
+                proxy_corr_path = candidate
+                break
+    if delta_corr_path is None:
+        for d in proxy_dirs:
+            candidate = d / "delta_correlations.csv"
+            if candidate.exists():
+                delta_corr_path = candidate
+                break
     out_path = args.out or root / "FINAL_VERDICT.md"
 
     bestness_df = _load(bestness_path, "summary_bestness.csv")
     weighted_df = _load(weighted_path, "weighted summary")
     corr_df = _load(proxy_corr_path, "proxy correlations")
-    delta_corr_df = (
-        delta_corr_path.exists() and _load(delta_corr_path, "delta correlations") or None
-    )
+    delta_corr_df = None
+    if delta_corr_path and delta_corr_path.exists():
+        delta_corr_df = _load(delta_corr_path, "delta correlations")
 
     _write_verdict(
         out_path,
