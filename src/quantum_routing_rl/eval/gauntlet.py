@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import os
 from pathlib import Path
 
 import pandas as pd
 
+from quantum_routing_rl.benchmarks.fetch_qasmbench import ensure_qasmbench
+from quantum_routing_rl.benchmarks.qasm_discovery import (
+    discover_qasm_root,
+    is_fixture_like,
+    pretty_print_discovery,
+)
 from quantum_routing_rl.eval import run_eval
 
 
@@ -33,13 +40,45 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hardware-directional", action="store_true")
     parser.add_argument("--hardware-snapshot-spacing", type=float, default=50_000.0)
     parser.add_argument("--seeds", type=int, nargs="+", default=[13, 17, 23])
-    parser.add_argument("--qasm-root", type=Path, help="Optional QASMBench root.")
+    parser.add_argument("--qasm-root", type=Path, help="(Deprecated) direct QASMBench root.")
+    parser.add_argument(
+        "--qasmbench-root",
+        type=Path,
+        help="Datasets directory that contains QASMBench; discovery picks the best .qasm subtree.",
+    )
+    parser.add_argument(
+        "--require-qasmbench",
+        action="store_true",
+        help="Fail fast unless a real QASMBench dataset (not fixtures) is found.",
+    )
+    parser.add_argument(
+        "--min-qasm",
+        type=int,
+        help="Override minimum required .qasm files (default depends on --mode).",
+    )
+    parser.add_argument(
+        "--auto-download-qasmbench",
+        action="store_true",
+        help="Attempt to fetch QASMBench if discovery fails or is too small.",
+    )
+    parser.add_argument(
+        "--qasmbench-url",
+        type=str,
+        default="https://github.com/pnnl/QASMBench",
+        help="Repository/zip URL for auto-download.",
+    )
+    parser.add_argument(
+        "--qasmbench-dest",
+        type=Path,
+        default=Path("artifacts/benchmarks/qasmbench_src"),
+        help="Destination folder for auto-downloaded QASMBench.",
+    )
     parser.add_argument("--selection-seed", type=int, default=7)
     return parser.parse_args(argv)
 
 
 def _timestamp_dir(base: Path | None = None) -> Path:
-    ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
     root = base or Path("artifacts") / "gauntlet"
     return root / ts
 
@@ -57,6 +96,79 @@ def _suite_list(mode: str) -> list[str]:
             "hard_medium",
         ]
     return ["qasmbench_hard", "hard_large"]
+
+
+def _min_qasm_required(mode: str, override: int | None) -> int:
+    if override is not None:
+        return override
+    if mode == "industrial":
+        return 2000
+    if mode == "full":
+        return 500
+    return 0
+
+
+def _should_require_qasm(args: argparse.Namespace) -> bool:
+    return args.require_qasmbench or args.mode in {"full", "industrial"}
+
+
+def _effective_qasm_root(args: argparse.Namespace) -> Path | None:
+    """Resolve dataset root with discovery, enforcement, and optional fetching."""
+
+    require = _should_require_qasm(args)
+    min_qasm = _min_qasm_required(args.mode, args.min_qasm)
+    env_root = (
+        Path(os.environ["QASMBENCH_ROOT"]).expanduser() if "QASMBENCH_ROOT" in os.environ else None
+    )
+    general_root = args.qasmbench_root or args.qasm_root or env_root
+
+    if not require and general_root is None:
+        return args.qasm_root  # allow fixtures when explicitly not required
+
+    if general_root is None and args.auto_download_qasmbench:
+        fetched = ensure_qasmbench(args.qasmbench_dest, repo=args.qasmbench_url)
+        if fetched:
+            general_root = fetched
+
+    if general_root is None:
+        msg = (
+            "[gauntlet] QASMBench dataset required for this mode. "
+            "Provide --qasmbench-root (datasets directory) or set QASMBENCH_ROOT, "
+            "or enable --auto-download-qasmbench."
+        )
+        raise SystemExit(msg)
+
+    discovery = discover_qasm_root(general_root)
+    print(pretty_print_discovery(discovery))
+    selected = discovery.get("selected_root")
+    count = discovery.get("qasm_count", 0)
+    if selected and not is_fixture_like(selected, count) and count >= min_qasm:
+        return Path(selected)
+
+    if args.auto_download_qasmbench:
+        fetched = ensure_qasmbench(args.qasmbench_dest, repo=args.qasmbench_url)
+        if fetched:
+            discovery = discover_qasm_root(fetched)
+            print("[gauntlet] after auto-download:")
+            print(pretty_print_discovery(discovery))
+            selected = discovery.get("selected_root")
+            count = discovery.get("qasm_count", 0)
+            if selected and not is_fixture_like(selected, count) and count >= min_qasm:
+                return Path(selected)
+
+    candidates = "\n".join(
+        f"- {path} ({cnt} qasm)" for path, cnt in discovery.get("candidates", [])
+    )
+    expl = (
+        "[gauntlet] Failed to locate a real QASMBench dataset.\n"
+        "The path you provided looks like the project repo or fixtures.\n"
+        "Provide the datasets folder that contains QASMBench (not this repo), "
+        "or enable --auto-download-qasmbench.\n"
+        f"Minimum required for mode '{args.mode}': {min_qasm} qasm files.\n"
+        "Top candidates seen:\n"
+        f"{candidates or '  (none)'}"
+    )
+    raise SystemExit(expl)
 
 
 def _write_summary(df: pd.DataFrame, mean_path: Path, std_path: Path) -> None:
@@ -151,6 +263,8 @@ def _run_single_suite(
     )
     if args.qasm_root:
         argv += ["--qasm-root", str(args.qasm_root)]
+    if _should_require_qasm(args):
+        argv.append("--require-qasmbench")
     if args.hardware_directional:
         argv.append("--hardware-directional")
     run_eval.main(argv)
@@ -159,6 +273,7 @@ def _run_single_suite(
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    args.qasm_root = _effective_qasm_root(args)
     out_root = _timestamp_dir(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
     selection_seed = args.selection_seed

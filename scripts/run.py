@@ -88,7 +88,7 @@ def cmd_test(args: argparse.Namespace) -> None:
 def _gauntlet(mode: str, args: argparse.Namespace) -> None:
     draws = args.hardware_draws or _hardware_draws()
     out_root = args.out or (_artifacts_root() / "gauntlet")
-    strict_qasm = args.require_qasmbench or _strict_qasm_env()
+    strict_qasm = args.require_qasmbench or _strict_qasm_env() or mode in {"full", "industrial"}
     cmd = [
         sys.executable,
         "-m",
@@ -118,6 +118,16 @@ def _gauntlet(mode: str, args: argparse.Namespace) -> None:
         cmd += ["--seeds", *[str(s) for s in args.seeds]]
     if args.qasm_root:
         cmd += ["--qasm-root", str(args.qasm_root)]
+    if getattr(args, "qasmbench_root", None):
+        cmd += ["--qasmbench-root", str(args.qasmbench_root)]
+    if getattr(args, "min_qasm", None) is not None:
+        cmd += ["--min-qasm", str(args.min_qasm)]
+    if getattr(args, "auto_download_qasmbench", False):
+        cmd.append("--auto-download-qasmbench")
+    if getattr(args, "qasmbench_url", None):
+        cmd += ["--qasmbench-url", args.qasmbench_url]
+    if getattr(args, "qasmbench_dest", None):
+        cmd += ["--qasmbench-dest", str(args.qasmbench_dest)]
     if strict_qasm:
         cmd.append("--require-qasmbench")
     if args.selection_seed is not None:
@@ -203,7 +213,9 @@ def cmd_print_mega_command(args: argparse.Namespace) -> None:
     hardware_draws = 1000 if cuda_available else 200
     runner_var = "${PYTHON_BIN:-.venv/bin/python3}"
     runner = "$PYTHON_BIN"
-    qasm_root_var = "${QASMBENCH_ROOT:?set QASMBENCH_ROOT to full QASMBench dataset}"
+    qasm_root_var = (
+        "${QASMBENCH_ROOT:?set QASMBENCH_ROOT to your datasets folder containing QASMBench}"
+    )
     exports = (
         f"export QASMBENCH_ROOT={qasm_root_var} QRRL_REQUIRE_QASMBENCH=1 "
         f"HARDWARE_DRAWS={hardware_draws} PYTHON_BIN={runner_var};"
@@ -217,7 +229,8 @@ def cmd_print_mega_command(args: argparse.Namespace) -> None:
     )
     directional_flag = " --hardware-directional" if args.hardware_directional else ""
     qasm_flags = (
-        f'--qasm-root "$QASMBENCH_ROOT" --selection-seed {selection_seed} --require-qasmbench'
+        f'--qasmbench-root "$QASMBENCH_ROOT" --selection-seed {selection_seed} '
+        f"--require-qasmbench --auto-download-qasmbench"
     )
     seed_flags = f"--seeds {seed_str}"
     bootstrap_cmd = "python3 scripts/bootstrap.py --dev --cuda --aer-gpu"
@@ -360,6 +373,29 @@ def build_parser() -> argparse.ArgumentParser:
         gp.add_argument("--hardware-snapshot-spacing", type=float, default=50_000.0)
         gp.add_argument("--seeds", type=int, nargs="+", help="Override gauntlet seeds")
         gp.add_argument("--qasm-root", type=Path, help="Optional QASMBench root")
+        gp.add_argument(
+            "--qasmbench-root",
+            type=Path,
+            help="Datasets directory that contains QASMBench; discovery finds the .qasm subtree.",
+        )
+        gp.add_argument("--min-qasm", type=int, help="Override minimum qasm files required")
+        gp.add_argument(
+            "--auto-download-qasmbench",
+            action="store_true",
+            help="Attempt to fetch QASMBench if discovery is missing or too small.",
+        )
+        gp.add_argument(
+            "--qasmbench-url",
+            type=str,
+            default="https://github.com/pnnl/QASMBench",
+            help="Repository/zip URL to fetch QASMBench from.",
+        )
+        gp.add_argument(
+            "--qasmbench-dest",
+            type=Path,
+            default=Path("artifacts/benchmarks/qasmbench_src"),
+            help="Destination folder for fetched QASMBench.",
+        )
         gp.add_argument("--selection-seed", type=int, help="Selection seed for QASMBench suites")
         gp.add_argument(
             "--require-qasmbench",
