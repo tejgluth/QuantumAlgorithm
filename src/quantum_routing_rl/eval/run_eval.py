@@ -26,7 +26,12 @@ from quantum_routing_rl.baselines.qiskit_baselines import (
     run_sabre_layout_swap,
 )
 from quantum_routing_rl.benchmarks.gauntlet_manager import GauntletSuite, build_suite
-from quantum_routing_rl.benchmarks.qasmbench_loader import QasmCircuit, load_suite
+from quantum_routing_rl.benchmarks.qasmbench_loader import (
+    QasmCircuit,
+    load_suite,
+    resolve_qasm_root,
+    strict_qasm_required,
+)
 from quantum_routing_rl.benchmarks.synthetic_generator import pressure_suite
 from quantum_routing_rl.benchmarks.topologies import (
     coupling_maps_for,
@@ -117,6 +122,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--qasm-root",
         type=Path,
         help="Path to local QASMBench root (defaults to env QASMBENCH_ROOT or tests fixtures).",
+    )
+    parser.add_argument(
+        "--require-qasmbench",
+        action="store_true",
+        help="Fail fast when QASMBENCH_ROOT is unset or points to fixtures.",
     )
     parser.add_argument(
         "--results-name",
@@ -402,14 +412,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 # ----------------------------------------------------------------- Suite helpers
-def _default_qasm_root() -> Path:
-    env_path = os.environ.get("QASMBENCH_ROOT")
-    if env_path:
-        return Path(env_path).expanduser()
-
-    # Fallback to in-repo fixtures for dev usage.
-    repo_root = Path(__file__).resolve().parent.parent.parent.parent
-    return repo_root / "tests" / "fixtures" / "qasmbench"
+def _default_qasm_root(require_real: bool = False) -> Path:
+    """Resolve QASMBench root while honoring strict-mode guardrails."""
+    return resolve_qasm_root(
+        None,
+        allow_fixtures=not require_real,
+        strict=require_real or strict_qasm_required(),
+    )
 
 
 def _build_coupling_maps(suite: str) -> dict[str, CouplingMap]:
@@ -672,7 +681,12 @@ def main(argv: list[str] | None = None) -> int:
 
     seeds = args.seeds or ([args.seed] if args.seed is not None else [13])
     selection_seed = args.selection_seed
-    qasm_root = Path(args.qasm_root or _default_qasm_root()).expanduser()
+    require_qasm = args.require_qasmbench or strict_qasm_required()
+    qasm_root = resolve_qasm_root(
+        args.qasm_root,
+        allow_fixtures=not require_qasm,
+        strict=require_qasm,
+    )
 
     gauntlet_suite: GauntletSuite | None = None
     suite_label = args.suite
@@ -1107,6 +1121,7 @@ def main(argv: list[str] | None = None) -> int:
             "suite_label": suite_label,
             "dev_limit": args.dev_limit,
             "qasm_root": str(qasm_root),
+            "require_qasmbench": require_qasm,
             "results": str(results_path),
             "summary": str(summary_path),
             "summary_std": str(summary_std_path) if summary_std_path else None,

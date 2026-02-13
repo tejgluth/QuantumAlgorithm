@@ -11,6 +11,41 @@ from typing import Iterable, Iterator
 
 from qiskit import QuantumCircuit
 
+STRICT_QASM_ENV = "QRRL_REQUIRE_QASMBENCH"
+
+
+def _fixture_root() -> Path:
+    return Path(__file__).resolve().parent.parent.parent.parent / "tests" / "fixtures" / "qasmbench"
+
+
+def fixture_qasm_root() -> Path:
+    """Public accessor for the bundled fixture dataset."""
+    return _fixture_root()
+
+
+def _strict_qasm_required() -> bool:
+    val = os.environ.get(STRICT_QASM_ENV, "").strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
+def strict_qasm_required() -> bool:
+    """Check env toggle that forbids fixture QASMBench usage."""
+    return _strict_qasm_required()
+
+
+def _is_fixture_root(path: Path) -> bool:
+    try:
+        resolved = path.expanduser().resolve()
+    except Exception:
+        resolved = path
+    fixture = _fixture_root().resolve()
+    return resolved == fixture or fixture in resolved.parents
+
+
+def is_fixture_root(path: Path) -> bool:
+    """Return True when ``path`` points inside the bundled fixtures."""
+    return _is_fixture_root(path)
+
 
 @dataclass(frozen=True)
 class QasmCircuit:
@@ -23,13 +58,65 @@ class QasmCircuit:
 
 def _resolve_root(root: str | Path | None) -> Path:
     """Prefer explicit root, fall back to env var."""
+    require_real = _strict_qasm_required()
+    resolved: Path | None = None
     if root is not None:
-        return Path(root).expanduser().resolve()
-    env_path = os.environ.get("QASMBENCH_ROOT")
-    if env_path:
-        return Path(env_path).expanduser().resolve()
-    msg = "QASMBench root not provided; set QASMBENCH_ROOT or pass --qasm-root pointing to the dataset."
-    raise FileNotFoundError(msg)
+        resolved = Path(root).expanduser().resolve()
+    else:
+        env_path = os.environ.get("QASMBENCH_ROOT")
+        if env_path:
+            resolved = Path(env_path).expanduser().resolve()
+    if resolved is None:
+        msg = (
+            "QASMBench root not provided; set QASMBENCH_ROOT or pass --qasm-root pointing to "
+            "the dataset."
+        )
+        raise FileNotFoundError(msg)
+    if require_real and _is_fixture_root(resolved):
+        msg = (
+            f"Strict mode ({STRICT_QASM_ENV}=1) disallows fixture QASMBench at {resolved}; "
+            "set QASMBENCH_ROOT to the full dataset."
+        )
+        raise FileNotFoundError(msg)
+    if not resolved.exists():
+        raise FileNotFoundError(f"QASMBench root not found: {resolved}")
+    return resolved
+
+
+def resolve_qasm_root(
+    root: str | Path | None,
+    *,
+    allow_fixtures: bool = True,
+    strict: bool | None = None,
+) -> Path:
+    """Resolve QASMBench root, optionally forbidding fixture fallbacks."""
+
+    require_real = _strict_qasm_required() if strict is None else strict
+    resolved: Path | None = None
+    if root is not None:
+        resolved = Path(root).expanduser()
+    else:
+        env_path = os.environ.get("QASMBENCH_ROOT")
+        if env_path:
+            resolved = Path(env_path).expanduser()
+        elif require_real:
+            msg = (
+                "Strict mode enabled; set QASMBENCH_ROOT or pass --qasm-root pointing to the full "
+                "QASMBench dataset."
+            )
+            raise FileNotFoundError(msg)
+        else:
+            resolved = _fixture_root()
+    if (require_real or not allow_fixtures) and _is_fixture_root(resolved):
+        msg = (
+            f"Strict mode ({STRICT_QASM_ENV}=1) disallows fixture QASMBench at {resolved}; "
+            "point QASMBENCH_ROOT to the full dataset."
+        )
+        raise FileNotFoundError(msg)
+    resolved = resolved.expanduser().resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(f"QASMBench root not found: {resolved}")
+    return resolved
 
 
 def discover_qasm_files(root: str | Path | None) -> list[Path]:

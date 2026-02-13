@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import random
 from pathlib import Path
 from typing import Iterable
@@ -35,6 +34,7 @@ from quantum_routing_rl.baselines.qiskit_baselines import (
     run_qiskit_sabre_trials,
 )
 from quantum_routing_rl.benchmarks.gauntlet_manager import build_suite
+from quantum_routing_rl.benchmarks.qasmbench_loader import resolve_qasm_root, strict_qasm_required
 from quantum_routing_rl.env.routing_env import RoutingEnvConfig
 from quantum_routing_rl.hardware.model import HardwareModel
 from quantum_routing_rl.models.weighted_sabre import (
@@ -62,6 +62,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional QASMBench root; defaults to env/QASMBENCH_ROOT or tests fixtures.",
     )
     parser.add_argument(
+        "--require-qasmbench",
+        action="store_true",
+        help="Fail if QASMBENCH_ROOT is unset or points to fixtures.",
+    )
+    parser.add_argument(
         "--include-weighted",
         action="store_true",
         help="Include weighted_sabre in validation (requires hardware model).",
@@ -69,12 +74,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _default_qasm_root() -> Path:
-    env_path = os.environ.get("QASMBENCH_ROOT")
-    if env_path:
-        return Path(env_path).expanduser()
-    repo_root = Path(__file__).resolve().parent.parent.parent.parent
-    return repo_root / "tests" / "fixtures" / "qasmbench"
+def _default_qasm_root(require_real: bool = False) -> Path:
+    return resolve_qasm_root(
+        None,
+        allow_fixtures=not require_real,
+        strict=require_real or strict_qasm_required(),
+    )
 
 
 def _hardware_for_graph(graph_id: str, coupling_map, seed: int) -> HardwareModel:
@@ -180,7 +185,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[proxy_validation] skipping: {AerImportError}")
         return 0
 
-    qasm_root = args.qasm_root or _default_qasm_root()
+    require_qasm = args.require_qasmbench or strict_qasm_required()
+    qasm_root = resolve_qasm_root(
+        args.qasm_root,
+        allow_fixtures=not require_qasm,
+        strict=require_qasm,
+    )
     suite = build_suite(
         "qasmbench_small",
         qasm_root=qasm_root,

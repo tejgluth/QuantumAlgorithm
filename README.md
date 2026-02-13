@@ -18,6 +18,10 @@ Noise-aware quantum circuit routing with the **Weighted SABRE** baseline, a repr
 
 `bootstrap.py` creates `.venv` by default (override with `QRRL_VENV_DIR`) and installs qiskit **and** qiskit-aer plus dev tools. No sudo required. `scripts/run.py` keeps the same interpreter so you never depend on `bin/` vs `Scripts/` paths.
 
+## Datasets (QASMBench) and strict mode
+- Set `QASMBENCH_ROOT=/abs/path/to/QASMBench` before running full/industrial suites.
+- Enable strict mode with `QRRL_REQUIRE_QASMBENCH=1` **or** `--require-qasmbench` on gauntlet/proxy commands to forbid the bundled fixtures; industrial/full tiers will fail fast if the real dataset is missing.
+
 ## Run the gauntlet (CPU path)
 - `HARDWARE_DRAWS=10 python3 scripts/run.py gauntlet-small`
 - Results land in `artifacts/gauntlet/<timestamp>/`. The combined CSV is `results_gauntlet_small.csv` with a matching summary.
@@ -28,8 +32,9 @@ Noise-aware quantum circuit routing with the **Weighted SABRE** baseline, a repr
 
 ## Ubuntu + CUDA route
 1) `python3 scripts/bootstrap.py --dev --cuda --aer-gpu`
-2) `HARDWARE_DRAWS=50 python3 scripts/run.py gauntlet-small`
-3) Proceed to the mega command in the **Final one-liner** section (runs full + industrial tiers plus validations).
+2) Export your dataset + strict guard: `export QASMBENCH_ROOT=/abs/path/to/QASMBench QRRL_REQUIRE_QASMBENCH=1`
+3) Smoke check (fast): `HARDWARE_DRAWS=2 python3 scripts/run.py gauntlet-small`
+4) Generate the CUDA-aware mega command: `python3 scripts/run.py print-mega-command` (auto-picks `HARDWARE_DRAWS=1000` when `nvidia-smi` is present, else 200).
 
 `--cuda` is best-effort: it tries the stock torch, then CUDA wheels (cu121 → cu118) if `nvidia-smi` is present. `--aer-gpu` is attempted only when CUDA torch is detected.
 
@@ -53,11 +58,13 @@ Artifacts live under `artifacts/gauntlet/<timestamp>/` with a copy of `FINAL_VER
 - Windows path quirks: never call `.venv/bin/python`; always invoke `python scripts/run.py ...` or `py -3 scripts\run.py ...`.
 
 ## Final one-liner (Ubuntu + CUDA)
-Run everything (bootstrap + gauntlet full + industrial + validations) in one pasteable command:
+Run everything (bootstrap + gauntlet full + industrial + invariants + proxy validation + verdict) in one pasteable line. This is exactly what `python3 scripts/run.py print-mega-command` emits on a CUDA box:
 
 ```bash
-HARDWARE_DRAWS=200 python3 scripts/bootstrap.py --dev --cuda --aer-gpu && HARDWARE_DRAWS=200 python3 scripts/run.py gauntlet-full && HARDWARE_DRAWS=200 python3 scripts/run.py gauntlet-industrial && python3 scripts/run.py invariants && python3 scripts/run.py validate-proxy-extended --include-weighted && python3 scripts/run.py verdict
+export QASMBENCH_ROOT=${QASMBENCH_ROOT:?set QASMBENCH_ROOT to full QASMBench dataset} QRRL_REQUIRE_QASMBENCH=1 HARDWARE_DRAWS=1000 PYTHON_BIN=${PYTHON_BIN:-.venv/bin/python3}; python3 scripts/bootstrap.py --dev --cuda --aer-gpu && $PYTHON_BIN scripts/run.py gauntlet-full --hardware-draws $HARDWARE_DRAWS --hardware-snapshots 3 --hardware-drift 0.01 --hardware-crosstalk 0.02 --hardware-snapshot-spacing 75000.0 --hardware-directional --seeds 13 17 23 29 31 37 41 --qasm-root "$QASMBENCH_ROOT" --selection-seed 11 --require-qasmbench && $PYTHON_BIN scripts/run.py gauntlet-industrial --hardware-draws $HARDWARE_DRAWS --hardware-snapshots 3 --hardware-drift 0.01 --hardware-crosstalk 0.02 --hardware-snapshot-spacing 75000.0 --hardware-directional --seeds 13 17 23 29 31 37 41 --qasm-root "$QASMBENCH_ROOT" --selection-seed 11 --require-qasmbench && $PYTHON_BIN scripts/run.py invariants && $PYTHON_BIN scripts/run.py validate-proxy-extended --include-weighted --max-circuits 120 --max-qubits 32 --shots 4096 --qasm-root "$QASMBENCH_ROOT" --selection-seed 11 --require-qasmbench && $PYTHON_BIN scripts/run.py verdict
 ```
+
+If `nvidia-smi` is absent, `print-mega-command` swaps `HARDWARE_DRAWS=1000` for `HARDWARE_DRAWS=200` but keeps the rest identical.
 
 ## Legacy experiments
 IL/RL/residual work remains under `experiments/legacy_rl/` for reference only. The main story is **Weighted SABRE + gauntlet + verdict**.

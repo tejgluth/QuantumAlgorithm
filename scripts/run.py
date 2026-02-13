@@ -15,6 +15,7 @@ from pathlib import Path
 
 ARTIFACTS_ENV = "ARTIFACTS"
 HARDWARE_DRAWS_ENV = "HARDWARE_DRAWS"
+STRICT_QASM_ENV = "QRRL_REQUIRE_QASMBENCH"
 DEFAULT_ARTIFACTS = "artifacts"
 
 
@@ -63,6 +64,10 @@ def _latest_gauntlet_file(run_dir: Path, prefix: str) -> Path | None:
     return candidates[-1] if candidates else None
 
 
+def _strict_qasm_env() -> bool:
+    return os.environ.get(STRICT_QASM_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def cmd_lint(_: argparse.Namespace) -> None:
     _run([sys.executable, "-m", "ruff", "check", "."])
     _run([sys.executable, "-m", "ruff", "format", "--check", "."])
@@ -83,6 +88,7 @@ def cmd_test(args: argparse.Namespace) -> None:
 def _gauntlet(mode: str, args: argparse.Namespace) -> None:
     draws = args.hardware_draws or _hardware_draws()
     out_root = args.out or (_artifacts_root() / "gauntlet")
+    strict_qasm = args.require_qasmbench or _strict_qasm_env()
     cmd = [
         sys.executable,
         "-m",
@@ -112,6 +118,8 @@ def _gauntlet(mode: str, args: argparse.Namespace) -> None:
         cmd += ["--seeds", *[str(s) for s in args.seeds]]
     if args.qasm_root:
         cmd += ["--qasm-root", str(args.qasm_root)]
+    if strict_qasm:
+        cmd.append("--require-qasmbench")
     if args.selection_seed is not None:
         cmd += ["--selection-seed", str(args.selection_seed)]
     _run(cmd)
@@ -162,6 +170,7 @@ def cmd_validate_proxy(args: argparse.Namespace) -> None:
         if not latest_run:
             raise RunError("No gauntlet runs found; provide --out for proxy validation")
         out_dir = latest_run / "proxy_validation_extended"
+    strict_qasm = args.require_qasmbench or _strict_qasm_env()
     cmd = [
         sys.executable,
         "-m",
@@ -179,9 +188,72 @@ def cmd_validate_proxy(args: argparse.Namespace) -> None:
     ]
     if args.qasm_root:
         cmd += ["--qasm-root", str(args.qasm_root)]
+    if strict_qasm:
+        cmd.append("--require-qasmbench")
     if args.include_weighted:
         cmd.append("--include-weighted")
     _run(cmd)
+
+
+def cmd_print_mega_command(args: argparse.Namespace) -> None:
+    seeds = args.seeds or [13, 17, 23, 29, 31, 37, 41]
+    seed_str = " ".join(str(s) for s in seeds)
+    selection_seed = args.selection_seed
+    cuda_available = shutil.which("nvidia-smi") is not None
+    hardware_draws = 1000 if cuda_available else 200
+    runner_var = "${PYTHON_BIN:-.venv/bin/python3}"
+    runner = "$PYTHON_BIN"
+    qasm_root_var = "${QASMBENCH_ROOT:?set QASMBENCH_ROOT to full QASMBench dataset}"
+    exports = (
+        f"export QASMBENCH_ROOT={qasm_root_var} QRRL_REQUIRE_QASMBENCH=1 "
+        f"HARDWARE_DRAWS={hardware_draws} PYTHON_BIN={runner_var};"
+    )
+    hw_flags = (
+        f"--hardware-draws $HARDWARE_DRAWS "
+        f"--hardware-snapshots {args.hardware_snapshots} "
+        f"--hardware-drift {args.hardware_drift} "
+        f"--hardware-crosstalk {args.hardware_crosstalk} "
+        f"--hardware-snapshot-spacing {args.hardware_snapshot_spacing}"
+    )
+    directional_flag = " --hardware-directional" if args.hardware_directional else ""
+    qasm_flags = (
+        f'--qasm-root "$QASMBENCH_ROOT" --selection-seed {selection_seed} --require-qasmbench'
+    )
+    seed_flags = f"--seeds {seed_str}"
+    bootstrap_cmd = "python3 scripts/bootstrap.py --dev --cuda --aer-gpu"
+    gauntlet_full_cmd = (
+        f"{runner} scripts/run.py gauntlet-full {hw_flags}{directional_flag} "
+        f"{seed_flags} {qasm_flags}"
+    )
+    gauntlet_industrial_cmd = (
+        f"{runner} scripts/run.py gauntlet-industrial {hw_flags}{directional_flag} "
+        f"{seed_flags} {qasm_flags}"
+    )
+    invariants_cmd = f"{runner} scripts/run.py invariants"
+    proxy_cmd = (
+        f"{runner} scripts/run.py validate-proxy-extended --include-weighted "
+        f"--max-circuits {args.proxy_max_circuits} --max-qubits {args.proxy_max_qubits} "
+        f"--shots {args.proxy_shots} {qasm_flags}"
+    )
+    verdict_cmd = f"{runner} scripts/run.py verdict"
+    mega_cmd = " ".join(
+        [
+            exports,
+            bootstrap_cmd,
+            "&&",
+            gauntlet_full_cmd,
+            "&&",
+            gauntlet_industrial_cmd,
+            "&&",
+            invariants_cmd,
+            "&&",
+            proxy_cmd,
+            "&&",
+            verdict_cmd,
+        ]
+    )
+    _log(f"CUDA detected: {cuda_available}; HARDWARE_DRAWS={hardware_draws}")
+    print(mega_cmd)
 
 
 def _find_verdict_inputs(
@@ -289,6 +361,11 @@ def build_parser() -> argparse.ArgumentParser:
         gp.add_argument("--seeds", type=int, nargs="+", help="Override gauntlet seeds")
         gp.add_argument("--qasm-root", type=Path, help="Optional QASMBench root")
         gp.add_argument("--selection-seed", type=int, help="Selection seed for QASMBench suites")
+        gp.add_argument(
+            "--require-qasmbench",
+            action="store_true",
+            help="Fail fast when QASMBENCH_ROOT is missing or points to fixtures",
+        )
         gp.add_argument("--out", type=Path, help="Base output directory (timestamp is appended)")
         gp.set_defaults(func=lambda a, m=mode: _gauntlet(m, a))
 
@@ -312,8 +389,60 @@ def build_parser() -> argparse.ArgumentParser:
     proxy.add_argument("--shots", type=int, default=1000)
     proxy.add_argument("--selection-seed", type=int, default=7)
     proxy.add_argument("--qasm-root", type=Path)
+    proxy.add_argument(
+        "--require-qasmbench",
+        action="store_true",
+        help="Fail if QASMBENCH_ROOT missing or fixtures would be used",
+    )
     proxy.add_argument("--include-weighted", action="store_true", help="Include weighted SABRE")
     proxy.set_defaults(func=cmd_validate_proxy)
+
+    mega = sub.add_parser(
+        "print-mega-command", help="Print a one-line CUDA pipeline command (gauntlet + verdict)"
+    )
+    mega.add_argument("--seeds", type=int, nargs="+", help="Seed list for gauntlet runs")
+    mega.add_argument("--selection-seed", type=int, default=11, help="Selection seed for circuits")
+    mega.add_argument(
+        "--hardware-snapshots", type=int, default=3, help="Number of hardware drift snapshots"
+    )
+    mega.add_argument("--hardware-drift", type=float, default=0.01, help="Hardware drift rate")
+    mega.add_argument(
+        "--hardware-crosstalk", type=float, default=0.02, help="Crosstalk penalty factor"
+    )
+    mega.add_argument(
+        "--hardware-snapshot-spacing",
+        type=float,
+        default=75_000.0,
+        help="Snapshot spacing in ns for mega run hardware models",
+    )
+    mega.add_argument(
+        "--hardware-directional",
+        action="store_true",
+        default=True,
+        help="Include directional error rates in mega command hardware models",
+    )
+    mega.add_argument(
+        "--no-hardware-directional",
+        dest="hardware_directional",
+        action="store_false",
+        help="Disable directional error rates in mega command hardware models",
+    )
+    mega.add_argument(
+        "--proxy-max-circuits",
+        type=int,
+        default=120,
+        help="Max (circuit, topology) pairs for proxy validation in mega command",
+    )
+    mega.add_argument(
+        "--proxy-max-qubits",
+        type=int,
+        default=32,
+        help="Max qubits allowed in proxy validation circuits",
+    )
+    mega.add_argument(
+        "--proxy-shots", type=int, default=4096, help="Shots for proxy validation simulator"
+    )
+    mega.set_defaults(func=cmd_print_mega_command)
 
     verdict = sub.add_parser("verdict", help="Assemble FINAL_VERDICT.md")
     verdict.add_argument("--audit-root", type=Path, help="Root directory with gauntlet artifacts")
