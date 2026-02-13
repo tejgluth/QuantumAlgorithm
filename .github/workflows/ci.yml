@@ -11,6 +11,13 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            python-path: ./.venv/bin/python
+          - os: macos-latest
+            python-path: ./.venv/bin/python
+          - os: windows-latest
+            python-path: ./.venv/Scripts/python.exe
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -22,16 +29,32 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Python version
+        run: python --version
+
       - name: Bootstrap (dev)
         run: python scripts/bootstrap.py --dev
 
+      - name: Ruff version (venv)
+        run: ${{ matrix.python-path }} -m ruff --version
+
+      - name: Ruff Lint
+        uses: astral-sh/ruff-action@v3
+        with:
+          args: "check ."
+
+      - name: Ruff Format Check
+        uses: astral-sh/ruff-action@v3
+        with:
+          args: "format --check ."
+
       - name: Lint
-        run: python scripts/run.py lint
+        run: ${{ matrix.python-path }} scripts/run.py lint
 
       - name: Tests
-        run: python scripts/run.py test --quiet
+        run: ${{ matrix.python-path }} scripts/run.py test --quiet
 
       - name: Gauntlet small smoke
         env:
           HARDWARE_DRAWS: 2
-        run: python scripts/run.py gauntlet-small --hardware-draws 2 --hardware-snapshots 1 --seeds 13
+        run: ${{ matrix.python-path }} scripts/run.py gauntlet-small --hardware-draws 2 --hardware-snapshots 1 --seeds 13
