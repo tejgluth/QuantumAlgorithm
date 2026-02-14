@@ -19,6 +19,10 @@ from quantum_routing_rl.eval.metrics import assert_coupling_compatible, compute_
 from quantum_routing_rl.hardware.model import HardwareModel
 from quantum_routing_rl.models.teacher import _normalize_edges, _sabre_initial_layout
 from quantum_routing_rl.routing.normalize_circuit import normalize_for_routing
+from quantum_routing_rl.routing.classical_safe import (
+    rebuild_with_classical,
+    strip_nonunitary,
+)
 from quantum_routing_rl.routing.weighted_distance import (
     WeightedDistanceCache,
     WeightedDistanceParams,
@@ -214,7 +218,8 @@ def route_with_weighted_sabre(
         msg = "hardware_model is required for weighted SABRE routing."
         raise ValueError(msg)
 
-    circuit, norm_meta = normalize_for_routing(circuit)
+    normalized_circuit, norm_meta = normalize_for_routing(circuit)
+    routing_circuit, meas_meta, nonunitary_meta = strip_nonunitary(normalized_circuit)
     norm_extra = {
         "normalized": norm_meta.get("normalized", False),
         "normalization_iters": norm_meta.get("iters", 0),
@@ -234,7 +239,7 @@ def route_with_weighted_sabre(
         )
 
     env_cfg = env_config or RoutingEnvConfig(frontier_size=4)
-    base_layout = _sabre_initial_layout(circuit, coupling_map, seed=seed)
+    base_layout = _sabre_initial_layout(routing_circuit, coupling_map, seed=seed)
     rng = random.Random(seed)
 
     best: BaselineResult | None = None
@@ -242,15 +247,20 @@ def route_with_weighted_sabre(
 
     for trial in range(max(1, trials)):
         trial_seed = None if seed is None else seed + trial
-        layout = _sabre_initial_layout(circuit, coupling_map, seed=trial_seed) or base_layout
+        layout = _sabre_initial_layout(routing_circuit, coupling_map, seed=trial_seed) or base_layout
         if layout is None:
             layout = base_layout
-        if layout is not None and trial > 0 and circuit.num_qubits >= 2 and layout == base_layout:
+        if (
+            layout is not None
+            and trial > 0
+            and routing_circuit.num_qubits >= 2
+            and layout == base_layout
+        ):
             layout = _perturb_layout(layout, rng)
 
         env = RoutingEnv(env_cfg)
         state = env.reset(
-            circuit,
+            routing_circuit,
             coupling_map,
             seed=trial_seed,
             hardware_model=hardware_model,
@@ -270,7 +280,7 @@ def route_with_weighted_sabre(
         router.begin_episode(graph, env.hardware_model)
 
         start = time.perf_counter()
-        step_budget = max(200, len(circuit.data) * 10)
+        step_budget = max(200, len(routing_circuit.data) * 10)
         steps = 0
         while not state.done and steps < step_budget:
             action_idx = router.select_action(state, graph, env.hardware_model)
@@ -284,7 +294,14 @@ def route_with_weighted_sabre(
             msg = f"Weighted SABRE routing exceeded step budget {step_budget}"
             raise RuntimeError(msg)
 
-        routed = env.routed_circuit
+        routed_quantum = env.routed_circuit
+        routed = rebuild_with_classical(
+            routed_quantum,
+            normalized_circuit,
+            meas_meta,
+            other_nonunitary=nonunitary_meta,
+            layout_map=state.layout,
+        )
         assert_coupling_compatible(routed, cmap_edges)
         metrics = compute_metrics(routed, hardware_model=hardware_model)
         result = BaselineResult(

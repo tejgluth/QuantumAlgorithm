@@ -56,6 +56,56 @@ class QasmCircuit:
     circuit: QuantumCircuit
 
 
+@dataclass
+class _LoadStats:
+    """Accumulates loader outcomes for concise reporting."""
+
+    warn_limit: int = 5
+    seen: int = 0
+    loaded_ok: int = 0
+    skipped_invalid: int = 0
+    skipped_unsupported: int = 0
+    warnings_emitted: int = 0
+
+    @property
+    def total_seen(self) -> int:
+        return self.seen
+
+    @property
+    def suppressed(self) -> int:
+        emitted_for_skips = min(
+            self.warnings_emitted, self.skipped_invalid + self.skipped_unsupported
+        )
+        return (self.skipped_invalid + self.skipped_unsupported) - emitted_for_skips
+
+    def _maybe_warn(self, message: str) -> None:
+        if self.warnings_emitted < self.warn_limit:
+            warnings.warn(message)
+            self.warnings_emitted += 1
+
+    def record_seen(self) -> None:
+        self.seen += 1
+
+    def record_invalid(self, path: Path, exc: Exception) -> None:
+        self.skipped_invalid += 1
+        self._maybe_warn(f"[qasmbench] skipping invalid QASM {path}: {exc}")
+
+    def record_unsupported(self, path: Path, reason: str) -> None:
+        self.skipped_unsupported += 1
+        self._maybe_warn(f"[qasmbench] unsupported dialect for {path} ({reason}); skipping.")
+
+    def record_loaded(self) -> None:
+        self.loaded_ok += 1
+
+    def summary_line(self) -> str:
+        return (
+            f"[qasmbench] loaded={self.loaded_ok} "
+            f"skipped_invalid={self.skipped_invalid} "
+            f"skipped_unsupported={self.skipped_unsupported} "
+            f"total_seen={self.total_seen}"
+        )
+
+
 def _resolve_root(root: str | Path | None) -> Path:
     """Prefer explicit root, fall back to env var."""
     require_real = _strict_qasm_required()
@@ -147,6 +197,45 @@ def load_qasm_file(path: str | Path) -> QuantumCircuit:
         raise ValueError(msg) from exc
 
 
+def _unsupported_reason(path: Path) -> str | None:
+    """Heuristic check for unsupported OpenQASM dialects."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return None
+    lowered = text.lower()
+    if "openqasm 3" in lowered:
+        return "OPENQASM 3"
+    if "defcal" in lowered:
+        return "OPENQASM 3 defcal"
+    return None
+
+
+def _load_with_stats(path: Path, stats: _LoadStats) -> QuantumCircuit | None:
+    """Load a QASM file while updating summary statistics."""
+    stats.record_seen()
+    reason = _unsupported_reason(path)
+    if reason:
+        stats.record_unsupported(path, reason)
+        return None
+
+    try:
+        qc = load_qasm_file(path)
+    except ValueError as exc:  # pragma: no cover - defensive skip path
+        stats.record_invalid(path, exc)
+        return None
+    return qc
+
+
+def _log_summary(stats: _LoadStats) -> None:
+    """Emit a concise summary and suppressed-warning count."""
+    if stats.suppressed > 0:
+        print(
+            f"[qasmbench] suppressed {stats.suppressed} additional invalid/unsupported warnings."
+        )
+    print(stats.summary_line())
+
+
 def _stable_order(items: Iterable[QasmCircuit], seed: int) -> list[QasmCircuit]:
     keyed = []
     for circuit in items:
@@ -179,21 +268,22 @@ def load_qasmbench_tier(
     tier = tier.lower()
     all_files = discover_qasm_files(root)
     root_path = _resolve_root(root)
+    stats = _LoadStats()
 
     circuits: list[QasmCircuit] = []
     for path in all_files:
-        try:
-            qc = load_qasm_file(path)
-        except ValueError as exc:  # pragma: no cover - defensive skip path
-            warnings.warn(f"[qasmbench] skipping invalid QASM {path}: {exc}")
+        qc = _load_with_stats(path, stats)
+        if qc is None:
             continue
         if not _limit_qubits(qc, min_qubits=min_qubits, max_qubits=max_qubits):
             continue
         circuits.append(QasmCircuit(_circuit_id_for_path(path, root_path), path, qc))
+        stats.record_loaded()
 
     ordered = _stable_order(circuits, selection_seed)
     if limit is not None:
         ordered = ordered[:limit]
+    _log_summary(stats)
     return ordered
 
 
@@ -216,6 +306,7 @@ def load_suite(
     if suite in {"dev", "full"}:
         all_files = discover_qasm_files(root)
         root_path = _resolve_root(root)
+        stats = _LoadStats()
 
         def _hash_key(path: Path) -> str:
             return hashlib.sha1(f"{path}:{selection_seed}".encode()).hexdigest()
@@ -234,10 +325,8 @@ def load_suite(
             )
 
         def _try_add(path: Path) -> None:
-            try:
-                circuit = load_qasm_file(path)
-            except ValueError as exc:  # pragma: no cover - defensive skip path
-                warnings.warn(f"[qasmbench] skipping invalid QASM {path}: {exc}")
+            circuit = _load_with_stats(path, stats)
+            if circuit is None:
                 return
             circuits.append(
                 QasmCircuit(
@@ -246,6 +335,7 @@ def load_suite(
                     circuit=circuit,
                 )
             )
+            stats.record_loaded()
 
         for path in selected_paths:
             _try_add(path)
@@ -256,6 +346,7 @@ def load_suite(
                 _try_add(path)
                 if len(circuits) >= dev_limit:
                     break
+        _log_summary(stats)
         return circuits
 
     tier_cfg = {
