@@ -117,6 +117,30 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Suite name (dev/pressure/full or gauntlet:<tier>).",
     )
     parser.add_argument("--dev-limit", type=int, default=20, help="Max circuits for dev suite.")
+    parser.add_argument(
+        "--max-circuits",
+        type=int,
+        help="Optional cap on number of loaded circuits (useful for fast smoke runs).",
+    )
+    parser.add_argument(
+        "--max-qubits",
+        type=int,
+        help="Optional cap on circuit width before selection/slicing.",
+    )
+    parser.add_argument(
+        "--max-ops",
+        type=int,
+        help="Optional cap on total operation count before selection/slicing.",
+    )
+    parser.add_argument(
+        "--circuit-selection",
+        choices=["stable", "smallest"],
+        default="stable",
+        help=(
+            "Ordering applied before --max-circuits: "
+            "'stable' keeps suite order, 'smallest' picks lowest (qubits, ops) first."
+        ),
+    )
     parser.add_argument("--out", type=Path, required=True, help="Output directory for artifacts.")
     parser.add_argument(
         "--qasm-root",
@@ -690,6 +714,7 @@ def main(argv: list[str] | None = None) -> int:
 
     gauntlet_suite: GauntletSuite | None = None
     suite_label = args.suite
+    compile_only = False
     if args.suite.startswith("gauntlet:"):
         g_name = args.suite.split(":", 1)[1]
         gauntlet_suite = build_suite(
@@ -705,6 +730,7 @@ def main(argv: list[str] | None = None) -> int:
         circuits = gauntlet_suite.circuits
         coupling_maps = gauntlet_suite.topologies
         suite_label = f"gauntlet:{gauntlet_suite.name}"
+        compile_only = bool(gauntlet_suite.metadata.get("compile_only", False))
     else:
         circuits = _load_benchmarks(
             args.suite,
@@ -715,6 +741,25 @@ def main(argv: list[str] | None = None) -> int:
             selection_seed=selection_seed,
         )
         coupling_maps = _build_coupling_maps(args.suite)
+    if args.max_qubits is not None:
+        max_qubits = max(0, int(args.max_qubits))
+        circuits = [c for c in circuits if c.circuit.num_qubits <= max_qubits]
+    if args.max_ops is not None:
+        max_ops = max(0, int(args.max_ops))
+        circuits = [c for c in circuits if len(c.circuit.data) <= max_ops]
+    if args.circuit_selection == "smallest":
+        circuits = sorted(
+            circuits,
+            key=lambda c: (c.circuit.num_qubits, len(c.circuit.data), c.circuit_id),
+        )
+    if args.max_circuits is not None:
+        circuits = circuits[: max(0, int(args.max_circuits))]
+    if not circuits:
+        msg = (
+            "No circuits selected after applying suite/filters. "
+            "Relax --max-qubits/--max-ops/--max-circuits or change --circuit-selection."
+        )
+        raise RuntimeError(msg)
     hardware_seeds = [args.hardware_seed_base + i for i in range(max(1, args.hardware_samples))]
     hardware_models = _build_hardware_models(
         coupling_maps,
@@ -825,26 +870,32 @@ def main(argv: list[str] | None = None) -> int:
                 hw_iter = list(zip(hardware_seeds, hw_list)) if hw_list else [(None, None)]
                 for hw_seed, hw_model in hw_iter:
                     if norm_meta.get("remaining_multiq", 0) > 0:
-                        baseline_names: list[str] = [
-                            "qiskit_basic_swap",
-                            "qiskit_lookahead_swap",
-                            "qiskit_commuting_2q_router",
-                            "sabre_layout_swap",
-                            "qiskit_sabre_best",
-                        ]
-                        if args.run_preset_opt3:
-                            baseline_names.append("qiskit_preset_opt3")
-                        baseline_names.extend(
-                            [f"qiskit_sabre_trials{t}" for t in qiskit_trial_budgets]
-                        )
-                        if args.include_teacher:
-                            baseline_names.append("teacher_sabre_like")
-                        if args.run_weighted_sabre and hw_model is not None:
-                            baseline_names.append("weighted_sabre")
-                        if il_model is not None:
-                            baseline_names.append(il_name)
-                        if residual_model is not None:
-                            baseline_names.append(residual_name)
+                        if compile_only:
+                            baseline_names = ["qiskit_sabre_best"]
+                            baseline_names.extend(
+                                [f"qiskit_sabre_trials{t}" for t in qiskit_trial_budgets]
+                            )
+                        else:
+                            baseline_names = [
+                                "qiskit_basic_swap",
+                                "qiskit_lookahead_swap",
+                                "qiskit_commuting_2q_router",
+                                "sabre_layout_swap",
+                                "qiskit_sabre_best",
+                            ]
+                            if args.run_preset_opt3:
+                                baseline_names.append("qiskit_preset_opt3")
+                            baseline_names.extend(
+                                [f"qiskit_sabre_trials{t}" for t in qiskit_trial_budgets]
+                            )
+                            if args.include_teacher:
+                                baseline_names.append("teacher_sabre_like")
+                            if args.run_weighted_sabre and hw_model is not None:
+                                baseline_names.append("weighted_sabre")
+                            if il_model is not None:
+                                baseline_names.append(il_name)
+                            if residual_model is not None:
+                                baseline_names.append(residual_name)
 
                         for bname in baseline_names:
                             skip_result = BaselineResult(
@@ -871,22 +922,34 @@ def main(argv: list[str] | None = None) -> int:
                         continue
 
                     teacher_swaps = None
-                    baselines = [
-                        run_basic_swap(norm_circuit, coupling, seed=seed, hardware_model=hw_model),
-                        run_lookahead_swap(
-                            norm_circuit, coupling, seed=seed, hardware_model=hw_model
-                        ),
-                        run_commuting_2q_router(
-                            norm_circuit, coupling, seed=seed, hardware_model=hw_model
-                        ),
-                        run_sabre_layout_swap(
-                            norm_circuit, coupling, seed=seed, hardware_model=hw_model
-                        ),
-                        run_best_available_sabre(
-                            norm_circuit, coupling, seed=seed, hardware_model=hw_model
-                        ),
-                    ]
-                    if args.run_preset_opt3:
+                    if compile_only:
+                        baselines = [
+                            run_best_available_sabre(
+                                norm_circuit,
+                                coupling,
+                                seed=seed,
+                                hardware_model=hw_model,
+                            )
+                        ]
+                    else:
+                        baselines = [
+                            run_basic_swap(
+                                norm_circuit, coupling, seed=seed, hardware_model=hw_model
+                            ),
+                            run_lookahead_swap(
+                                norm_circuit, coupling, seed=seed, hardware_model=hw_model
+                            ),
+                            run_commuting_2q_router(
+                                norm_circuit, coupling, seed=seed, hardware_model=hw_model
+                            ),
+                            run_sabre_layout_swap(
+                                norm_circuit, coupling, seed=seed, hardware_model=hw_model
+                            ),
+                            run_best_available_sabre(
+                                norm_circuit, coupling, seed=seed, hardware_model=hw_model
+                            ),
+                        ]
+                    if not compile_only and args.run_preset_opt3:
                         baselines.append(
                             run_preset_opt3(
                                 norm_circuit,
@@ -917,7 +980,7 @@ def main(argv: list[str] | None = None) -> int:
                                 hardware_profile=args.hardware_profile,
                             )
                         )
-                    if args.include_teacher:
+                    if not compile_only and args.include_teacher:
                         teacher_result = route_with_teacher(
                             norm_circuit,
                             coupling,
@@ -937,7 +1000,7 @@ def main(argv: list[str] | None = None) -> int:
                                 hardware_profile=args.hardware_profile,
                             )
                         )
-                    if args.run_weighted_sabre:
+                    if not compile_only and args.run_weighted_sabre:
                         if hw_model is None:
                             print(
                                 f"[warn] weighted_sabre requires hardware model for {graph_id}; skipping."
@@ -971,7 +1034,7 @@ def main(argv: list[str] | None = None) -> int:
                                         hardware_profile=args.hardware_profile,
                                     )
                                 )
-                    if il_model is not None:
+                    if not compile_only and il_model is not None:
                         try:
                             il_result = route_with_policy(
                                 il_model,
@@ -1001,7 +1064,7 @@ def main(argv: list[str] | None = None) -> int:
                                     hardware_profile=args.hardware_profile,
                                 )
                             )
-                    if residual_model is not None:
+                    if not compile_only and residual_model is not None:
                         try:
                             if args.residual_multistep:
                                 residual_result = route_with_multistep_residual(
@@ -1055,7 +1118,7 @@ def main(argv: list[str] | None = None) -> int:
                                     hardware_profile=args.hardware_profile,
                                 )
                             )
-                    if rl_model is not None:
+                    if not compile_only and rl_model is not None:
                         try:
                             rl_result = route_with_policy(
                                 rl_model,
@@ -1120,6 +1183,10 @@ def main(argv: list[str] | None = None) -> int:
             "suite": args.suite,
             "suite_label": suite_label,
             "dev_limit": args.dev_limit,
+            "max_circuits": args.max_circuits,
+            "max_qubits": args.max_qubits,
+            "max_ops": args.max_ops,
+            "circuit_selection": args.circuit_selection,
             "qasm_root": str(qasm_root),
             "require_qasmbench": require_qasm,
             "results": str(results_path),
@@ -1131,6 +1198,7 @@ def main(argv: list[str] | None = None) -> int:
             "coupling_maps": list(coupling_maps.keys()),
             "benchmark_sources": suite_sources,
             "gauntlet_metadata": gauntlet_meta,
+            "compile_only": compile_only,
             "il_checkpoint": str(il_ckpt) if il_ckpt else None,
             "rl_checkpoint": str(rl_ckpt) if rl_ckpt else None,
             "il_name": il_name if il_model else None,

@@ -230,9 +230,7 @@ def _load_with_stats(path: Path, stats: _LoadStats) -> QuantumCircuit | None:
 def _log_summary(stats: _LoadStats) -> None:
     """Emit a concise summary and suppressed-warning count."""
     if stats.suppressed > 0:
-        print(
-            f"[qasmbench] suppressed {stats.suppressed} additional invalid/unsupported warnings."
-        )
+        print(f"[qasmbench] suppressed {stats.suppressed} additional invalid/unsupported warnings.")
     print(stats.summary_line())
 
 

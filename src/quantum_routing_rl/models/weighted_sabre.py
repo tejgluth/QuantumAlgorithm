@@ -12,7 +12,7 @@ import networkx as nx
 from qiskit.circuit import QuantumCircuit
 from qiskit.transpiler import CouplingMap
 
-from quantum_routing_rl.baselines.qiskit_baselines import BaselineResult
+from quantum_routing_rl.baselines.qiskit_baselines import BaselineResult, run_best_available_sabre
 from quantum_routing_rl.env.routing_env import RoutingEnv, RoutingEnvConfig
 from quantum_routing_rl.env.state import LogicalGate, RoutingState
 from quantum_routing_rl.eval.metrics import assert_coupling_compatible, compute_metrics
@@ -20,6 +20,7 @@ from quantum_routing_rl.hardware.model import HardwareModel
 from quantum_routing_rl.models.teacher import _normalize_edges, _sabre_initial_layout
 from quantum_routing_rl.routing.normalize_circuit import normalize_for_routing
 from quantum_routing_rl.routing.classical_safe import (
+    classical_dependency_ops,
     rebuild_with_classical,
     strip_nonunitary,
 )
@@ -219,7 +220,6 @@ def route_with_weighted_sabre(
         raise ValueError(msg)
 
     normalized_circuit, norm_meta = normalize_for_routing(circuit)
-    routing_circuit, meas_meta, nonunitary_meta = strip_nonunitary(normalized_circuit)
     norm_extra = {
         "normalized": norm_meta.get("normalized", False),
         "normalization_iters": norm_meta.get("iters", 0),
@@ -238,91 +238,165 @@ def route_with_weighted_sabre(
             extra=norm_extra,
         )
 
-    env_cfg = env_config or RoutingEnvConfig(frontier_size=4)
-    base_layout = _sabre_initial_layout(routing_circuit, coupling_map, seed=seed)
-    rng = random.Random(seed)
-
-    best: BaselineResult | None = None
-    cmap_edges = _normalize_edges(coupling_map)
-
-    for trial in range(max(1, trials)):
-        trial_seed = None if seed is None else seed + trial
-        layout = _sabre_initial_layout(routing_circuit, coupling_map, seed=trial_seed) or base_layout
-        if layout is None:
-            layout = base_layout
-        if (
-            layout is not None
-            and trial > 0
-            and routing_circuit.num_qubits >= 2
-            and layout == base_layout
-        ):
-            layout = _perturb_layout(layout, rng)
-
-        env = RoutingEnv(env_cfg)
-        state = env.reset(
-            routing_circuit,
-            coupling_map,
-            seed=trial_seed,
-            hardware_model=hardware_model,
-            initial_layout=layout,
-        )
-        graph = env.graph
-        if graph is None:
-            msg = "RoutingEnv did not provide a coupling graph."
-            raise RuntimeError(msg)
-
-        router = WeightedSabreRouter(
-            weights=router_weights,
-            distance_params=distance_params,
-            snapshot_mode=snapshot_mode,
-            rng_seed=trial_seed,
-        )
-        router.begin_episode(graph, env.hardware_model)
-
-        start = time.perf_counter()
-        step_budget = max(200, len(routing_circuit.data) * 10)
-        steps = 0
-        while not state.done and steps < step_budget:
-            action_idx = router.select_action(state, graph, env.hardware_model)
-            swap_edge = state.candidate_swaps[action_idx]
-            state, _, _, _ = env.step(action_idx)
-            router.update_after_action(swap_edge, state.step_count)
-            steps += 1
-
-        runtime = time.perf_counter() - start
-        if not state.done:
-            msg = f"Weighted SABRE routing exceeded step budget {step_budget}"
-            raise RuntimeError(msg)
-
-        routed_quantum = env.routed_circuit
-        routed = rebuild_with_classical(
-            routed_quantum,
+    # The environment-based router cannot preserve semantics for classically
+    # controlled instructions. Fall back to robust Qiskit SABRE instead of
+    # crashing on circuits like ipea_n2.
+    classical_ops = classical_dependency_ops(normalized_circuit)
+    if classical_ops:
+        fallback = run_best_available_sabre(
             normalized_circuit,
-            meas_meta,
-            other_nonunitary=nonunitary_meta,
-            layout_map=state.layout,
+            coupling_map,
+            seed=seed,
+            hardware_model=hardware_model,
         )
-        assert_coupling_compatible(routed, cmap_edges)
-        metrics = compute_metrics(routed, hardware_model=hardware_model)
-        result = BaselineResult(
+        return BaselineResult(
             name="weighted_sabre",
-            circuit=routed,
-            metrics=metrics,
-            runtime_s=runtime,
-            seed=trial_seed,
+            circuit=fallback.circuit,
+            metrics=fallback.metrics,
+            runtime_s=fallback.runtime_s,
+            seed=seed,
+            baseline_status="fallback",
+            fallback_used=True,
+            fallback_reason="UNSUPPORTED_CLASSICAL_CONTROL",
             extra={
                 **norm_extra,
-                "trial": trial,
+                "fallback_source": fallback.name,
+                "classical_control_ops": "|".join(classical_ops),
+                "trial": 0,
                 "trials_total": max(1, trials),
                 "alpha_time": (distance_params.alpha_time if distance_params else 0.0),
                 "beta_xtalk": (distance_params.beta_xtalk if distance_params else 0.0),
                 "snapshot_mode": snapshot_mode,
             },
         )
-        best = _choose_best_trial(best, result)
 
-    assert best is not None
-    return best
+    routing_circuit, meas_meta, nonunitary_meta = strip_nonunitary(normalized_circuit)
+
+    env_cfg = env_config or RoutingEnvConfig(frontier_size=4)
+    base_layout = _sabre_initial_layout(routing_circuit, coupling_map, seed=seed)
+    rng = random.Random(seed)
+
+    best: BaselineResult | None = None
+    cmap_edges = _normalize_edges(coupling_map)
+    trial_failures: list[str] = []
+    twoq_total = sum(
+        1
+        for inst in routing_circuit.data
+        if inst.operation.num_qubits == 2 and inst.operation.name != "swap"
+    )
+    # Bound runtime on very deep circuits while still allowing meaningful routing.
+    step_budget = max(200, min(4000, 8 * twoq_total + 30))
+
+    for trial in range(max(1, trials)):
+        trial_seed = None if seed is None else seed + trial
+        try:
+            layout = (
+                _sabre_initial_layout(routing_circuit, coupling_map, seed=trial_seed) or base_layout
+            )
+            if layout is None:
+                layout = base_layout
+            if (
+                layout is not None
+                and trial > 0
+                and routing_circuit.num_qubits >= 2
+                and layout == base_layout
+            ):
+                layout = _perturb_layout(layout, rng)
+
+            env = RoutingEnv(env_cfg)
+            state = env.reset(
+                routing_circuit,
+                coupling_map,
+                seed=trial_seed,
+                hardware_model=hardware_model,
+                initial_layout=layout,
+            )
+            graph = env.graph
+            if graph is None:
+                msg = "RoutingEnv did not provide a coupling graph."
+                raise RuntimeError(msg)
+
+            router = WeightedSabreRouter(
+                weights=router_weights,
+                distance_params=distance_params,
+                snapshot_mode=snapshot_mode,
+                rng_seed=trial_seed,
+            )
+            router.begin_episode(graph, env.hardware_model)
+
+            start = time.perf_counter()
+            steps = 0
+            while not state.done and steps < step_budget:
+                action_idx = router.select_action(state, graph, env.hardware_model)
+                swap_edge = state.candidate_swaps[action_idx]
+                state, _, _, _ = env.step(action_idx)
+                router.update_after_action(swap_edge, state.step_count)
+                steps += 1
+
+            runtime = time.perf_counter() - start
+            if not state.done:
+                trial_failures.append(f"trial={trial}:STEP_BUDGET_EXCEEDED:{steps}/{step_budget}")
+                continue
+
+            routed_quantum = env.routed_circuit
+            routed = rebuild_with_classical(
+                routed_quantum,
+                normalized_circuit,
+                meas_meta,
+                other_nonunitary=nonunitary_meta,
+                layout_map=state.layout,
+            )
+            assert_coupling_compatible(routed, cmap_edges)
+            metrics = compute_metrics(routed, hardware_model=hardware_model)
+            result = BaselineResult(
+                name="weighted_sabre",
+                circuit=routed,
+                metrics=metrics,
+                runtime_s=runtime,
+                seed=trial_seed,
+                extra={
+                    **norm_extra,
+                    "trial": trial,
+                    "trials_total": max(1, trials),
+                    "alpha_time": (distance_params.alpha_time if distance_params else 0.0),
+                    "beta_xtalk": (distance_params.beta_xtalk if distance_params else 0.0),
+                    "snapshot_mode": snapshot_mode,
+                },
+            )
+            best = _choose_best_trial(best, result)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            trial_failures.append(f"trial={trial}:{exc.__class__.__name__}:{exc}")
+            continue
+
+    if best is not None:
+        return best
+
+    fallback = run_best_available_sabre(
+        normalized_circuit,
+        coupling_map,
+        seed=seed,
+        hardware_model=hardware_model,
+    )
+    return BaselineResult(
+        name="weighted_sabre",
+        circuit=fallback.circuit,
+        metrics=fallback.metrics,
+        runtime_s=fallback.runtime_s,
+        seed=seed,
+        baseline_status="fallback",
+        fallback_used=True,
+        fallback_reason="ROUTER_FAILED",
+        extra={
+            **norm_extra,
+            "fallback_source": fallback.name,
+            "trial_failures_count": len(trial_failures),
+            "trial_failures": " || ".join(trial_failures[:8]),
+            "trials_total": max(1, trials),
+            "alpha_time": (distance_params.alpha_time if distance_params else 0.0),
+            "beta_xtalk": (distance_params.beta_xtalk if distance_params else 0.0),
+            "snapshot_mode": snapshot_mode,
+        },
+    )
 
 
 # --------------------------------------------------------------------------- #

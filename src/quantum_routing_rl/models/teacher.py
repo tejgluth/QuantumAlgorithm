@@ -16,6 +16,7 @@ from quantum_routing_rl.env.state import LogicalGate, RoutingState
 from quantum_routing_rl.eval.metrics import assert_coupling_compatible, compute_metrics
 from quantum_routing_rl.hardware.model import HardwareModel
 from quantum_routing_rl.routing.normalize_circuit import normalize_for_routing
+from quantum_routing_rl.routing.classical_safe import classical_dependency_ops
 
 
 @dataclass(frozen=True)
@@ -223,6 +224,18 @@ def route_with_teacher(
             baseline_status="SKIPPED",
             skip_reason=norm_meta.get("skipped_reason"),
             extra=norm_extra,
+        )
+    classical_ops = classical_dependency_ops(circuit)
+    if classical_ops:
+        return BaselineResult(
+            name=name,
+            circuit=None,
+            metrics=None,
+            runtime_s=0.0,
+            seed=seed,
+            baseline_status="SKIPPED",
+            skip_reason="UNSUPPORTED_CLASSICAL_CONTROL",
+            extra={**norm_extra, "classical_control_ops": "|".join(classical_ops)},
         )
 
     env_cfg = env_config or RoutingEnvConfig(frontier_size=4)

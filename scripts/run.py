@@ -132,6 +132,18 @@ def _gauntlet(mode: str, args: argparse.Namespace) -> None:
         cmd.append("--require-qasmbench")
     if args.selection_seed is not None:
         cmd += ["--selection-seed", str(args.selection_seed)]
+    if getattr(args, "max_circuits_per_suite", None) is not None:
+        cmd += ["--max-circuits-per-suite", str(args.max_circuits_per_suite)]
+    if getattr(args, "max_qubits_per_suite", None) is not None:
+        cmd += ["--max-qubits-per-suite", str(args.max_qubits_per_suite)]
+    if getattr(args, "max_ops_per_circuit", None) is not None:
+        cmd += ["--max-ops-per-circuit", str(args.max_ops_per_circuit)]
+    if getattr(args, "circuit_selection", None):
+        cmd += ["--circuit-selection", str(args.circuit_selection)]
+    if getattr(args, "qiskit_trials", None):
+        cmd += ["--qiskit-trials", *[str(v) for v in args.qiskit_trials]]
+    if getattr(args, "weighted_trials", None) is not None:
+        cmd += ["--weighted-trials", str(args.weighted_trials)]
     _run(cmd)
     latest = _latest_gauntlet_run(out_root)
     if latest:
@@ -397,6 +409,38 @@ def build_parser() -> argparse.ArgumentParser:
             help="Destination folder for fetched QASMBench.",
         )
         gp.add_argument("--selection-seed", type=int, help="Selection seed for QASMBench suites")
+        gp.add_argument(
+            "--max-circuits-per-suite",
+            type=int,
+            help="Optional cap on circuits per suite (fast validation mode).",
+        )
+        gp.add_argument(
+            "--max-qubits-per-suite",
+            type=int,
+            help="Optional width cap per suite for fast validation mode.",
+        )
+        gp.add_argument(
+            "--max-ops-per-circuit",
+            type=int,
+            help="Optional operation-count cap per suite for fast validation mode.",
+        )
+        gp.add_argument(
+            "--circuit-selection",
+            choices=["stable", "smallest"],
+            default="stable",
+            help="Ordering applied before per-suite max-circuit slicing.",
+        )
+        gp.add_argument(
+            "--qiskit-trials",
+            type=int,
+            nargs="+",
+            help="Override Qiskit SABRE trial budgets for gauntlet runs.",
+        )
+        gp.add_argument(
+            "--weighted-trials",
+            type=int,
+            help="Override weighted SABRE trial count for gauntlet runs.",
+        )
         gp.add_argument(
             "--require-qasmbench",
             action="store_true",

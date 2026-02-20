@@ -104,3 +104,56 @@ def test_auto_download_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     assert base_out.exists()
     runs = list(base_out.iterdir())
     assert runs, "timestamped gauntlet output was not created"
+
+
+def test_run_eval_receives_fast_validation_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    qasm_root = tmp_path / "datasets" / "QASMBench"
+    for i in range(60):
+        _write_qasm(qasm_root / "small" / f"toy_{i}.qasm")
+    calls: list[list[str]] = []
+
+    def fake_run_eval(argv: list[str]) -> None:
+        calls.append(argv)
+        out_dir = Path(argv[argv.index("--out") + 1])
+        results_name = argv[argv.index("--results-name") + 1]
+        _stub_results(out_dir, results_name)
+
+    monkeypatch.setattr(gauntlet.run_eval, "main", fake_run_eval)
+
+    exit_code = gauntlet.main(
+        [
+            "--mode",
+            "small",
+            "--qasmbench-root",
+            str(qasm_root),
+            "--out",
+            str(tmp_path / "gauntlet_out"),
+            "--seeds",
+            "1",
+            "--max-circuits-per-suite",
+            "1",
+            "--max-qubits-per-suite",
+            "12",
+            "--max-ops-per-circuit",
+            "500",
+            "--circuit-selection",
+            "smallest",
+            "--qiskit-trials",
+            "1",
+            "2",
+            "--weighted-trials",
+            "3",
+        ]
+    )
+
+    assert exit_code == 0
+    assert calls, "run_eval.main was not invoked"
+    for argv in calls:
+        assert "--max-circuits" in argv
+        assert "--max-qubits" in argv
+        assert "--max-ops" in argv
+        assert "--circuit-selection" in argv
+        assert "--qiskit-trials" in argv
+        assert "--weighted-trials" in argv

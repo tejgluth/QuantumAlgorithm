@@ -74,6 +74,40 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Destination folder for auto-downloaded QASMBench.",
     )
     parser.add_argument("--selection-seed", type=int, default=7)
+    parser.add_argument(
+        "--qiskit-trials",
+        type=int,
+        nargs="+",
+        default=[1, 8, 16],
+        help="Qiskit SABRE trial budgets to evaluate (default: 1 8 16).",
+    )
+    parser.add_argument(
+        "--weighted-trials",
+        type=int,
+        default=8,
+        help="Weighted SABRE trial count (default: 8).",
+    )
+    parser.add_argument(
+        "--max-circuits-per-suite",
+        type=int,
+        help="Optional cap passed to run_eval --max-circuits for faster validation runs.",
+    )
+    parser.add_argument(
+        "--max-qubits-per-suite",
+        type=int,
+        help="Optional width cap passed to run_eval --max-qubits.",
+    )
+    parser.add_argument(
+        "--max-ops-per-circuit",
+        type=int,
+        help="Optional operation cap passed to run_eval --max-ops.",
+    )
+    parser.add_argument(
+        "--circuit-selection",
+        choices=["stable", "smallest"],
+        default="stable",
+        help="Ordering passed to run_eval before per-suite slicing.",
+    )
     return parser.parse_args(argv)
 
 
@@ -102,9 +136,12 @@ def _min_qasm_required(mode: str, override: int | None) -> int:
     if override is not None:
         return override
     if mode == "industrial":
-        return 2000
+        # Upstream pnnl/QASMBench currently provides ~252 .qasm files.
+        # Keep strict mode meaningful while remaining compatible with the
+        # canonical public dataset.
+        return 240
     if mode == "full":
-        return 500
+        return 200
     return 0
 
 
@@ -244,9 +281,7 @@ def _run_single_suite(
             "--hardware-crosstalk",
             str(args.hardware_crosstalk),
             "--qiskit-trials",
-            "1",
-            "8",
-            "16",
+            *[str(max(1, int(v))) for v in args.qiskit_trials],
             "--run-weighted-sabre",
             "--weighted-alpha-time",
             "0.5",
@@ -255,7 +290,7 @@ def _run_single_suite(
             "--weighted-snapshot-mode",
             "avg",
             "--weighted-trials",
-            "8",
+            str(max(1, int(args.weighted_trials))),
             "--run-preset-opt3",
             "--selection-seed",
             str(selection_seed),
@@ -263,6 +298,13 @@ def _run_single_suite(
     )
     if args.qasm_root:
         argv += ["--qasm-root", str(args.qasm_root)]
+    if args.max_circuits_per_suite is not None:
+        argv += ["--max-circuits", str(max(0, int(args.max_circuits_per_suite)))]
+    if args.max_qubits_per_suite is not None:
+        argv += ["--max-qubits", str(max(0, int(args.max_qubits_per_suite)))]
+    if args.max_ops_per_circuit is not None:
+        argv += ["--max-ops", str(max(0, int(args.max_ops_per_circuit)))]
+    argv += ["--circuit-selection", args.circuit_selection]
     if _should_require_qasm(args):
         argv.append("--require-qasmbench")
     if args.hardware_directional:

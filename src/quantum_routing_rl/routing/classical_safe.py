@@ -12,6 +12,32 @@ from qiskit.circuit import ClassicalRegister, QuantumCircuit
 _NONUNITARY_NAMES = {"measure", "reset", "barrier", "delay"}
 
 
+def _has_classical_dependency(inst) -> bool:
+    """Return True when an instruction depends on classical state."""
+
+    if inst.operation.name in _NONUNITARY_NAMES:
+        return False
+    if inst.clbits:
+        return True
+    return getattr(inst.operation, "condition", None) is not None
+
+
+def classical_dependency_ops(circuit: QuantumCircuit) -> list[str]:
+    """List operation names that carry classical dependencies."""
+
+    ops: list[str] = []
+    seen: set[str] = set()
+    for inst in circuit.data:
+        if not _has_classical_dependency(inst):
+            continue
+        name = inst.operation.name
+        if name in seen:
+            continue
+        seen.add(name)
+        ops.append(name)
+    return ops
+
+
 @dataclass(frozen=True)
 class MeasurementMeta:
     """Lightweight record of a measurement."""
@@ -60,6 +86,10 @@ def strip_nonunitary(
         if name in _NONUNITARY_NAMES:
             nonunitary.append(NonUnitaryMeta(idx, inst.operation, qubit_indices, clbit_indices))
             continue
+
+        if _has_classical_dependency(inst):
+            msg = f"UNSUPPORTED_CLASSICAL_CONTROL op={name} clbits={len(clbit_indices)} index={idx}"
+            raise ValueError(msg)
 
         # Drop any classical bits to avoid cross-circuit clbit issues.
         quantum_only.append(inst.operation, inst.qubits, [])

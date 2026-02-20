@@ -20,7 +20,7 @@ Noise-aware quantum circuit routing with the **Weighted SABRE** baseline, a repr
 
 ## Where QASMBench lives
 - Point `QASMBENCH_ROOT` **or** `--qasmbench-root` to your datasets folder (the directory that contains the `QASMBench/` checkout). Do **not** aim it at this git repo; fixtures are ignored.
-- Discovery auto-picks the subtree with the most `.qasm` files, prints counts, and requires 500+ (full) / 2000+ (industrial) when strict mode is on.
+- Discovery auto-picks the subtree with the most `.qasm` files, prints counts, and requires 200+ (full) / 240+ (industrial) when strict mode is on.
 - Strict guard: set `QRRL_REQUIRE_QASMBENCH=1` or pass `--require-qasmbench`; this blocks fixture fallbacks even in small mode.
 - Missing dataset? Add `--auto-download-qasmbench` to fetch into `artifacts/benchmarks/qasmbench_src` (git clone first, zip fallback; no sudo).
 
@@ -42,7 +42,10 @@ Noise-aware quantum circuit routing with the **Weighted SABRE** baseline, a repr
 ## Ubuntu + CUDA route
 1) `python3 scripts/bootstrap.py --dev --cuda --aer-gpu`
 2) Export your dataset + strict guard: `export QASMBENCH_ROOT=/abs/path/to/datasets QRRL_REQUIRE_QASMBENCH=1`
-3) Smoke check (fast): `HARDWARE_DRAWS=2 python3 scripts/run.py gauntlet-small`
+3) Smoke check (fast, closest to final behavior without long runtimes):
+   - `python3 scripts/run.py gauntlet-small --hardware-draws 1 --hardware-snapshots 2 --hardware-drift 0.01 --hardware-crosstalk 0.02 --hardware-snapshot-spacing 75000 --hardware-directional --seeds 13 --qasmbench-root "$QASMBENCH_ROOT" --selection-seed 11 --require-qasmbench --max-circuits-per-suite 2 --max-qubits-per-suite 16 --max-ops-per-circuit 2000 --circuit-selection smallest --qiskit-trials 1 4 --weighted-trials 4`
+   - `python3 scripts/run.py gauntlet-full --hardware-draws 1 --hardware-snapshots 2 --hardware-drift 0.01 --hardware-crosstalk 0.02 --hardware-snapshot-spacing 75000 --hardware-directional --seeds 13 --qasmbench-root "$QASMBENCH_ROOT" --selection-seed 11 --require-qasmbench --max-circuits-per-suite 1 --max-qubits-per-suite 16 --max-ops-per-circuit 2000 --circuit-selection smallest --qiskit-trials 1 --weighted-trials 2`
+   - `python3 scripts/run.py gauntlet-industrial --hardware-draws 1 --hardware-snapshots 2 --hardware-drift 0.01 --hardware-crosstalk 0.02 --hardware-snapshot-spacing 75000 --hardware-directional --seeds 13 --qasmbench-root "$QASMBENCH_ROOT" --selection-seed 11 --require-qasmbench --max-circuits-per-suite 1 --max-qubits-per-suite 24 --circuit-selection smallest --qiskit-trials 1 --weighted-trials 1`
 4) Generate the CUDA-aware mega command: `python3 scripts/run.py print-mega-command` (auto-picks `HARDWARE_DRAWS=1000` when `nvidia-smi` is present, else 200).
 
 `--cuda` is best-effort: it tries the stock torch, then CUDA wheels (cu121 → cu118) if `nvidia-smi` is present. `--aer-gpu` is attempted only when CUDA torch is detected.
