@@ -182,6 +182,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Deterministic seed for benchmark selection / synthetic generation.",
     )
     parser.add_argument(
+        "--torch-device",
+        type=str,
+        default="auto",
+        help="Torch device for learned policies (auto/cpu/cuda/cuda:0).",
+    )
+    parser.add_argument(
         "--qiskit-trials",
         type=int,
         nargs="+",
@@ -413,7 +419,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--hardware-drift",
         type=float,
         default=0.0,
-        help="Relative drift rate applied between snapshots (e.g., 0.05 = ±5%).",
+        help="Relative drift rate applied between snapshots (e.g., 0.05 = +/-5%%).",
     )
     parser.add_argument(
         "--hardware-snapshot-spacing",
@@ -697,6 +703,29 @@ def _default_checkpoint(out_dir: Path, names: Iterable[str]) -> Path | None:
     return None
 
 
+def _resolve_torch_device(spec: str):
+    """Resolve desired torch device, falling back safely to CPU."""
+
+    try:
+        import torch
+    except Exception:
+        return None, "unavailable"
+
+    requested = (spec or "auto").strip().lower()
+    if requested in {"auto", ""}:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return device, str(device)
+    try:
+        device = torch.device(requested)
+    except Exception:
+        print(f"[warn] unknown --torch-device '{spec}', falling back to cpu.")
+        return torch.device("cpu"), "cpu"
+    if device.type == "cuda" and not torch.cuda.is_available():
+        print("[warn] CUDA requested but unavailable; falling back to cpu.")
+        return torch.device("cpu"), "cpu"
+    return device, str(device)
+
+
 # ----------------------------------------------------------------------- Main
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
@@ -797,6 +826,7 @@ def main(argv: list[str] | None = None) -> int:
 
     il_ckpt = args.il_checkpoint or _default_checkpoint(out_dir, ["il_soft", "il"])
     rl_ckpt = args.rl_checkpoint or _default_checkpoint(out_dir, ["rl_ppo", "rl"])
+    torch_device, torch_device_label = _resolve_torch_device(args.torch_device)
     if args.residual_multistep:
         residual_ckpt = args.residual_checkpoint
     else:
@@ -814,14 +844,22 @@ def main(argv: list[str] | None = None) -> int:
         else:
             rl_name = "rl_policy"
     residual_name = "residual_multistep" if args.residual_multistep else "residual_topk"
-    il_model = load_swap_policy(il_ckpt) if il_ckpt and Path(il_ckpt).exists() else None
-    rl_model = load_swap_policy(rl_ckpt) if rl_ckpt and Path(rl_ckpt).exists() else None
+    il_model = (
+        load_swap_policy(il_ckpt, device=torch_device)
+        if il_ckpt and Path(il_ckpt).exists()
+        else None
+    )
+    rl_model = (
+        load_swap_policy(rl_ckpt, device=torch_device)
+        if rl_ckpt and Path(rl_ckpt).exists()
+        else None
+    )
     residual_model = None
     residual_scorer = None
     if args.residual_multistep:
         if residual_ckpt and Path(residual_ckpt).exists():
             try:
-                residual_scorer = load_residual_scorer(residual_ckpt)
+                residual_scorer = load_residual_scorer(residual_ckpt, device=torch_device)
             except Exception as exc:  # pragma: no cover - defensive
                 print(f"[warn] failed to load residual scorer from {residual_ckpt}: {exc}")
         elif args.residual_checkpoint:
@@ -845,6 +883,7 @@ def main(argv: list[str] | None = None) -> int:
                 top_k=args.residual_top_k,
                 allow_fallback=not args.residual_no_fallback,
                 teacher_bias=args.residual_teacher_bias,
+                device=torch_device,
             )
         elif args.residual_checkpoint:
             print(
@@ -1194,6 +1233,7 @@ def main(argv: list[str] | None = None) -> int:
             "summary_std": str(summary_std_path) if summary_std_path else None,
             "seeds": seeds,
             "selection_seed": selection_seed,
+            "torch_device": torch_device_label,
             "circuits_evaluated": len(circuits),
             "coupling_maps": list(coupling_maps.keys()),
             "benchmark_sources": suite_sources,

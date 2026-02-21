@@ -183,10 +183,16 @@ class ResidualTopKPolicy:
         graph: nx.Graph,
         hardware: HardwareModel | None = None,
     ) -> ResidualAction:
+        try:
+            scorer_device = next(self.scorer.parameters()).device
+        except StopIteration:
+            scorer_device = torch.device("cpu")
         teacher_scores = torch.tensor(
-            self.teacher.score_candidates(state, graph, hardware), dtype=torch.float32
+            self.teacher.score_candidates(state, graph, hardware),
+            dtype=torch.float32,
+            device=scorer_device,
         )
-        mask = torch.tensor(state.action_mask, dtype=torch.bool)
+        mask = torch.tensor(state.action_mask, dtype=torch.bool, device=scorer_device)
         if not mask.any():
             return ResidualAction(
                 action_index=0, fallback_used=True, teacher_choice=None, utilities=None
@@ -213,6 +219,8 @@ class ResidualTopKPolicy:
         cand_feats, context = _candidate_and_context(
             state, graph, hardware, topk_idx, include_hardware=self.include_hardware
         )
+        cand_feats = cand_feats.to(scorer_device)
+        context = context.to(scorer_device)
         with torch.no_grad():
             utilities = self.scorer(cand_feats, context)
         combined = utilities
@@ -344,6 +352,7 @@ def load_residual_policy(
         context_dim=context_dim,
     )
     scorer.load_state_dict(payload[state_key])
+    scorer.to(device)
     scorer.eval()
     policy = ResidualTopKPolicy(
         scorer,

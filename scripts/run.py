@@ -140,6 +140,10 @@ def _gauntlet(mode: str, args: argparse.Namespace) -> None:
         cmd += ["--max-ops-per-circuit", str(args.max_ops_per_circuit)]
     if getattr(args, "circuit_selection", None):
         cmd += ["--circuit-selection", str(args.circuit_selection)]
+    if getattr(args, "jobs", None) is not None:
+        cmd += ["--jobs", str(args.jobs)]
+    if getattr(args, "torch_device", None):
+        cmd += ["--torch-device", str(args.torch_device)]
     if getattr(args, "qiskit_trials", None):
         cmd += ["--qiskit-trials", *[str(v) for v in args.qiskit_trials]]
     if getattr(args, "weighted_trials", None) is not None:
@@ -207,13 +211,25 @@ def cmd_validate_proxy(args: argparse.Namespace) -> None:
         str(args.shots),
         "--selection-seed",
         str(args.selection_seed),
+        "--aer-device",
+        str(args.aer_device),
+        "--aer-method",
+        str(args.aer_method),
+        "--aer-precision",
+        str(args.aer_precision),
     ]
+    if args.aer_max_parallel_threads is not None:
+        cmd += ["--aer-max-parallel-threads", str(args.aer_max_parallel_threads)]
+    if args.aer_max_parallel_experiments is not None:
+        cmd += ["--aer-max-parallel-experiments", str(args.aer_max_parallel_experiments)]
     if args.qasm_root:
         cmd += ["--qasm-root", str(args.qasm_root)]
     if strict_qasm:
         cmd.append("--require-qasmbench")
     if args.include_weighted:
         cmd.append("--include-weighted")
+    if args.aer_strict_device:
+        cmd.append("--aer-strict-device")
     _run(cmd)
 
 
@@ -240,6 +256,10 @@ def cmd_print_mega_command(args: argparse.Namespace) -> None:
         f"--hardware-snapshot-spacing {args.hardware_snapshot_spacing}"
     )
     directional_flag = " --hardware-directional" if args.hardware_directional else ""
+    cpu_count = os.cpu_count() or 1
+    auto_jobs = max(1, min(8, cpu_count // 4 if cpu_count >= 8 else cpu_count))
+    gauntlet_jobs = args.gauntlet_jobs or auto_jobs
+    gauntlet_job_flags = f" --jobs {gauntlet_jobs} --torch-device auto"
     qasm_flags = (
         f'--qasmbench-root "$QASMBENCH_ROOT" --selection-seed {selection_seed} '
         f"--require-qasmbench --auto-download-qasmbench"
@@ -247,18 +267,21 @@ def cmd_print_mega_command(args: argparse.Namespace) -> None:
     seed_flags = f"--seeds {seed_str}"
     bootstrap_cmd = "python3 scripts/bootstrap.py --dev --cuda --aer-gpu"
     gauntlet_full_cmd = (
-        f"{runner} scripts/run.py gauntlet-full {hw_flags}{directional_flag} "
+        f"{runner} scripts/run.py gauntlet-full {hw_flags}{directional_flag}{gauntlet_job_flags} "
         f"{seed_flags} {qasm_flags}"
     )
     gauntlet_industrial_cmd = (
-        f"{runner} scripts/run.py gauntlet-industrial {hw_flags}{directional_flag} "
+        f"{runner} scripts/run.py gauntlet-industrial {hw_flags}{directional_flag}{gauntlet_job_flags} "
         f"{seed_flags} {qasm_flags}"
     )
     invariants_cmd = f"{runner} scripts/run.py invariants"
+    proxy_device = "gpu" if cuda_available else "cpu"
     proxy_cmd = (
         f"{runner} scripts/run.py validate-proxy-extended --include-weighted "
         f"--max-circuits {args.proxy_max_circuits} --max-qubits {args.proxy_max_qubits} "
-        f"--shots {args.proxy_shots} {qasm_flags}"
+        f"--shots {args.proxy_shots} --aer-device {proxy_device} "
+        f"--aer-max-parallel-threads {cpu_count} --aer-max-parallel-experiments {min(16, cpu_count)} "
+        f"{qasm_flags}"
     )
     verdict_cmd = f"{runner} scripts/run.py verdict"
     mega_cmd = " ".join(
@@ -277,7 +300,10 @@ def cmd_print_mega_command(args: argparse.Namespace) -> None:
             verdict_cmd,
         ]
     )
-    _log(f"CUDA detected: {cuda_available}; HARDWARE_DRAWS={hardware_draws}")
+    _log(
+        f"CUDA detected: {cuda_available}; HARDWARE_DRAWS={hardware_draws}; "
+        f"gauntlet_jobs={gauntlet_jobs}"
+    )
     print(mega_cmd)
 
 
@@ -442,6 +468,18 @@ def build_parser() -> argparse.ArgumentParser:
             help="Override weighted SABRE trial count for gauntlet runs.",
         )
         gp.add_argument(
+            "--jobs",
+            type=int,
+            default=1,
+            help="Number of gauntlet suites to execute in parallel (processes).",
+        )
+        gp.add_argument(
+            "--torch-device",
+            type=str,
+            default="auto",
+            help="Torch device forwarded to run_eval for learned-policy inference.",
+        )
+        gp.add_argument(
             "--require-qasmbench",
             action="store_true",
             help="Fail fast when QASMBENCH_ROOT is missing or points to fixtures",
@@ -470,6 +508,39 @@ def build_parser() -> argparse.ArgumentParser:
     proxy.add_argument("--selection-seed", type=int, default=7)
     proxy.add_argument("--qasm-root", type=Path)
     proxy.add_argument(
+        "--aer-device",
+        choices=["auto", "cpu", "gpu"],
+        default="auto",
+        help="Aer simulator device preference.",
+    )
+    proxy.add_argument(
+        "--aer-method",
+        type=str,
+        default="automatic",
+        help="Aer simulation method.",
+    )
+    proxy.add_argument(
+        "--aer-precision",
+        choices=["single", "double"],
+        default="single",
+        help="Aer precision mode.",
+    )
+    proxy.add_argument(
+        "--aer-strict-device",
+        action="store_true",
+        help="Fail when requested Aer device is unavailable.",
+    )
+    proxy.add_argument(
+        "--aer-max-parallel-threads",
+        type=int,
+        help="Override Aer max_parallel_threads.",
+    )
+    proxy.add_argument(
+        "--aer-max-parallel-experiments",
+        type=int,
+        help="Override Aer max_parallel_experiments.",
+    )
+    proxy.add_argument(
         "--require-qasmbench",
         action="store_true",
         help="Fail if QASMBENCH_ROOT missing or fixtures would be used",
@@ -482,6 +553,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mega.add_argument("--seeds", type=int, nargs="+", help="Seed list for gauntlet runs")
     mega.add_argument("--selection-seed", type=int, default=11, help="Selection seed for circuits")
+    mega.add_argument(
+        "--gauntlet-jobs",
+        type=int,
+        help="Override gauntlet suite parallelism for mega command.",
+    )
     mega.add_argument(
         "--hardware-snapshots", type=int, default=3, help="Number of hardware drift snapshots"
     )

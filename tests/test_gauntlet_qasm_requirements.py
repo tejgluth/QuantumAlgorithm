@@ -145,6 +145,10 @@ def test_run_eval_receives_fast_validation_flags(
             "2",
             "--weighted-trials",
             "3",
+            "--jobs",
+            "1",
+            "--torch-device",
+            "cpu",
         ]
     )
 
@@ -157,3 +161,45 @@ def test_run_eval_receives_fast_validation_flags(
         assert "--circuit-selection" in argv
         assert "--qiskit-trials" in argv
         assert "--weighted-trials" in argv
+        assert "--torch-device" in argv
+
+
+def test_gauntlet_skips_suite_when_filters_remove_all(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    qasm_root = tmp_path / "datasets" / "QASMBench"
+    for i in range(60):
+        _write_qasm(qasm_root / "small" / f"toy_{i}.qasm")
+
+    def fake_run_eval(argv: list[str]) -> None:
+        suite_name = argv[argv.index("--suite") + 1]
+        if suite_name == "gauntlet:pressure":
+            raise RuntimeError("No circuits selected after applying suite/filters.")
+        out_dir = Path(argv[argv.index("--out") + 1])
+        results_name = argv[argv.index("--results-name") + 1]
+        _stub_results(out_dir, results_name)
+
+    monkeypatch.setattr(gauntlet.run_eval, "main", fake_run_eval)
+
+    exit_code = gauntlet.main(
+        [
+            "--mode",
+            "small",
+            "--qasmbench-root",
+            str(qasm_root),
+            "--out",
+            str(tmp_path / "gauntlet_out"),
+            "--seeds",
+            "1",
+            "--jobs",
+            "1",
+        ]
+    )
+
+    assert exit_code == 0
+    runs = sorted((tmp_path / "gauntlet_out").iterdir())
+    assert runs, "timestamped gauntlet output was not created"
+    combined = runs[-1] / "results_gauntlet_small.csv"
+    assert combined.exists()
+    df = pd.read_csv(combined)
+    assert not df.empty

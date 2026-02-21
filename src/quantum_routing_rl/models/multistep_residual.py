@@ -81,11 +81,13 @@ class StateValueNet(torch.nn.Module):
 def load_state_value_model(
     path: str | "os.PathLike[str]", device: torch.device | None = None
 ) -> StateValueNet:
-    payload = torch.load(path, map_location=device or "cpu")
+    target_device = device or torch.device("cpu")
+    payload = torch.load(path, map_location=target_device)
     input_dim = int(payload.get("input_dim", 32))
     hidden = int(payload.get("hidden_dim", 128))
     model = StateValueNet(input_dim=input_dim, hidden=hidden)
     model.load_state_dict(payload["model_state"])
+    model.to(target_device)
     model.eval()
     return model
 
@@ -93,7 +95,8 @@ def load_state_value_model(
 def load_residual_scorer(
     checkpoint: str | "os.PathLike[str]", device: torch.device | None = None
 ) -> ResidualScorer:
-    payload = torch.load(checkpoint, map_location=device or "cpu")
+    target_device = device or torch.device("cpu")
+    payload = torch.load(checkpoint, map_location=target_device)
     state_key = "scorer_state" if "scorer_state" in payload else "model_state"
     feature_dim = int(payload.get("feature_dim", 16))
     hidden_dim = int(payload.get("hidden_dim", 256))
@@ -104,6 +107,7 @@ def load_residual_scorer(
         context_dim=context_dim,
     )
     scorer.load_state_dict(payload[state_key])
+    scorer.to(target_device)
     scorer.eval()
     return scorer
 
@@ -335,7 +339,11 @@ class MultiStepResidualPolicy:
         )
         if self.value_model is not None:
             with torch.no_grad():
-                ctx = context
+                try:
+                    value_device = next(self.value_model.parameters()).device
+                except StopIteration:
+                    value_device = torch.device("cpu")
+                ctx = context.to(value_device)
                 target_dim = self.value_model.net[0].in_features  # type: ignore[index]
                 if ctx.numel() != target_dim:
                     if ctx.numel() > target_dim:

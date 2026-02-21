@@ -299,12 +299,17 @@ def policy_step(
     model: SwapPolicy, state: RoutingState, graph: nx.Graph, hardware: HardwareModel | None = None
 ) -> PolicyOutput:
     """Compute greedy action from model."""
+    try:
+        model_device = next(model.parameters()).device
+    except StopIteration:
+        model_device = torch.device("cpu")
     with torch.no_grad():
         feats = model_features(state, graph, hardware)
         feats = _match_feature_dim(feats, model.net[0].in_features)
+        feats = feats.to(model_device)
         raw_scores = model(feats)
         logits = _scores_to_logits(raw_scores, model)
-        mask_tensor = torch.tensor(state.action_mask, dtype=torch.bool)
+        mask_tensor = torch.tensor(state.action_mask, dtype=torch.bool, device=model_device)
         action = choose_action(logits, mask_tensor)
     return PolicyOutput(action_index=action, logits=logits)
 
@@ -396,6 +401,10 @@ def route_with_policy(
                 teacher_swaps = None
         if teacher_swaps:
             guard_target = float(swap_guard_ratio) * float(teacher_swaps)
+    try:
+        model_device = next(model.parameters()).device
+    except StopIteration:
+        model_device = torch.device("cpu")
     start = time.perf_counter()
     base_budget = max_steps or max(200, len(circuit.data) * 10)
     policy_budget = base_budget if allow_fallback else base_budget * 2
@@ -413,9 +422,10 @@ def route_with_policy(
         else:
             feats = model_features(state, graph, hardware)
             feats = _match_feature_dim(feats, model.net[0].in_features)  # type: ignore[index]
+            feats = feats.to(model_device)
             raw_scores = model(feats)
             logits = _scores_to_logits(raw_scores, model)
-            mask_tensor = torch.tensor(state.action_mask, dtype=torch.bool)
+            mask_tensor = torch.tensor(state.action_mask, dtype=torch.bool, device=model_device)
             logits = logits.masked_fill(~mask_tensor, -1e9)
             if teacher_for_mix is not None:
                 scores = torch.tensor(

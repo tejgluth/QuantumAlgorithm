@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime
 import os
 from pathlib import Path
@@ -16,6 +17,8 @@ from quantum_routing_rl.benchmarks.qasm_discovery import (
     pretty_print_discovery,
 )
 from quantum_routing_rl.eval import run_eval
+
+_NO_CIRCUITS_MSG = "No circuits selected after applying suite/filters."
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -107,6 +110,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["stable", "smallest"],
         default="stable",
         help="Ordering passed to run_eval before per-suite slicing.",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Number of suites to evaluate in parallel (processes).",
+    )
+    parser.add_argument(
+        "--torch-device",
+        type=str,
+        default="auto",
+        help="Torch device passed to run_eval for learned-policy inference.",
     )
     return parser.parse_args(argv)
 
@@ -245,7 +260,7 @@ def _baseline_comparison(df: pd.DataFrame, out_path: Path) -> None:
 
 def _run_single_suite(
     suite: str, args: argparse.Namespace, out_root: Path, selection_seed: int
-) -> Path:
+) -> tuple[list[str], Path]:
     suite_dir = out_root / suite
     results_name = f"results_{suite}.csv"
     summary_name = f"summary_{suite}.csv"
@@ -294,6 +309,8 @@ def _run_single_suite(
             "--run-preset-opt3",
             "--selection-seed",
             str(selection_seed),
+            "--torch-device",
+            args.torch_device,
         ]
     )
     if args.qasm_root:
@@ -309,8 +326,21 @@ def _run_single_suite(
         argv.append("--require-qasmbench")
     if args.hardware_directional:
         argv.append("--hardware-directional")
-    run_eval.main(argv)
-    return suite_dir / results_name
+    return argv, suite_dir / results_name
+
+
+def _run_eval_worker(argv: list[str]) -> int:
+    """Process worker entrypoint for suite-level parallel execution."""
+
+    from quantum_routing_rl.eval import run_eval as worker_run_eval
+
+    try:
+        status = worker_run_eval.main(argv)
+    except RuntimeError as exc:
+        if _NO_CIRCUITS_MSG in str(exc):
+            return 204
+        raise
+    return 0 if status is None else int(status)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -320,13 +350,58 @@ def main(argv: list[str] | None = None) -> int:
     out_root.mkdir(parents=True, exist_ok=True)
     selection_seed = args.selection_seed
     suites = _suite_list(args.mode)
-    result_paths: list[Path] = []
+    jobs = max(1, int(args.jobs))
+    planned: list[tuple[str, list[str], Path]] = []
     for suite in suites:
-        path = _run_single_suite(suite, args, out_root, selection_seed)
-        result_paths.append(path)
+        suite_argv, result_path = _run_single_suite(suite, args, out_root, selection_seed)
+        planned.append((suite, suite_argv, result_path))
+
+    result_paths: list[Path] = []
+    if jobs == 1:
+        for suite, suite_argv, result_path in planned:
+            try:
+                status = run_eval.main(suite_argv)
+                exit_code = 0 if status is None else int(status)
+            except RuntimeError as exc:
+                if _NO_CIRCUITS_MSG in str(exc):
+                    exit_code = 204
+                else:
+                    raise
+            if exit_code == 204:
+                print(f"[gauntlet] skipped suite {suite}: no circuits after filters")
+                continue
+            if exit_code != 0:
+                raise RuntimeError(f"Suite '{suite}' failed with exit code {exit_code}")
+            result_paths.append(result_path)
+    else:
+        max_workers = min(jobs, len(planned))
+        print(f"[gauntlet] running {len(planned)} suites with jobs={max_workers}")
+        completed: dict[str, Path] = {}
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as pool:
+            fut_map = {
+                pool.submit(_run_eval_worker, suite_argv): (suite, result_path)
+                for suite, suite_argv, result_path in planned
+            }
+            for fut in concurrent.futures.as_completed(fut_map):
+                suite, result_path = fut_map[fut]
+                exit_code = fut.result()
+                if exit_code == 204:
+                    print(f"[gauntlet] skipped suite {suite}: no circuits after filters")
+                    continue
+                if exit_code != 0:
+                    raise RuntimeError(f"Suite '{suite}' failed with exit code {exit_code}")
+                completed[suite] = result_path
+                print(f"[gauntlet] completed suite {suite}")
+        for suite, _, _ in planned:
+            path = completed.get(suite)
+            if path is not None:
+                result_paths.append(path)
     if not result_paths:
         print("[gauntlet] no suites executed")
         return 1
+    for path in result_paths:
+        if not path.exists():
+            raise FileNotFoundError(f"Expected suite result missing: {path}")
     df = pd.concat(pd.read_csv(p) for p in result_paths)
     combined_results = out_root / f"results_gauntlet_{args.mode}.csv"
     df.to_csv(combined_results, index=False)

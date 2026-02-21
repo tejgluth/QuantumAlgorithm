@@ -30,6 +30,8 @@ def test_run_eval_emits_qiskit_trials_baseline(tmp_path):
         "5",
         "--hardware-samples",
         "1",
+        "--torch-device",
+        "cpu",
         "--qiskit-trials",
         "1",
         "2",

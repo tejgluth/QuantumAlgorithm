@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 from pathlib import Path
 from typing import Iterable
@@ -71,7 +72,95 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Include weighted_sabre in validation (requires hardware model).",
     )
+    parser.add_argument(
+        "--aer-device",
+        choices=["auto", "cpu", "gpu"],
+        default="auto",
+        help="Aer simulator device preference.",
+    )
+    parser.add_argument(
+        "--aer-method",
+        type=str,
+        default="automatic",
+        help="Aer simulation method (automatic, density_matrix, statevector, ...).",
+    )
+    parser.add_argument(
+        "--aer-precision",
+        choices=["single", "double"],
+        default="single",
+        help="Aer floating-point precision.",
+    )
+    parser.add_argument(
+        "--aer-strict-device",
+        action="store_true",
+        help="Fail instead of falling back when requested Aer device is unavailable.",
+    )
+    parser.add_argument(
+        "--aer-max-parallel-threads",
+        type=int,
+        help="Override Aer max_parallel_threads (defaults to CPU count).",
+    )
+    parser.add_argument(
+        "--aer-max-parallel-experiments",
+        type=int,
+        help="Override Aer max_parallel_experiments (defaults to CPU-count based heuristic).",
+    )
     return parser.parse_args(argv)
+
+
+def _create_aer_simulator(
+    noise_model: NoiseModel,
+    *,
+    device_pref: str,
+    method: str,
+    precision: str,
+    strict_device: bool,
+    max_parallel_threads: int | None = None,
+    max_parallel_experiments: int | None = None,
+) -> tuple[object, str]:
+    """Create AerSimulator honoring device preference with safe fallbacks."""
+
+    base_kwargs = {"noise_model": noise_model}
+    if method and method != "automatic":
+        base_kwargs["method"] = method
+    if precision:
+        base_kwargs["precision"] = precision
+    if max_parallel_threads is not None:
+        base_kwargs["max_parallel_threads"] = max(1, int(max_parallel_threads))
+    if max_parallel_experiments is not None:
+        base_kwargs["max_parallel_experiments"] = max(1, int(max_parallel_experiments))
+
+    def _build(device: str):
+        try:
+            return AerSimulator(**base_kwargs, device=device)
+        except TypeError:
+            # Older Aer versions may not support precision/device kwargs.
+            kwargs = dict(base_kwargs)
+            kwargs.pop("precision", None)
+            if device in {"CPU", "GPU"}:
+                try:
+                    return AerSimulator(**kwargs, device=device)
+                except TypeError:
+                    return AerSimulator(**kwargs)
+            return AerSimulator(**kwargs)
+
+    pref = (device_pref or "auto").lower()
+    if pref == "cpu":
+        return _build("CPU"), "cpu"
+    if pref == "gpu":
+        try:
+            return _build("GPU"), "gpu"
+        except Exception as exc:
+            if strict_device:
+                raise RuntimeError(f"Aer GPU requested but unavailable: {exc}") from exc
+            print(f"[proxy_validation] Aer GPU unavailable, falling back to CPU: {exc}")
+            return _build("CPU"), "cpu"
+
+    # auto: try GPU first, then CPU.
+    try:
+        return _build("GPU"), "gpu"
+    except Exception:
+        return _build("CPU"), "cpu"
 
 
 def _default_qasm_root(require_real: bool = False) -> Path:
@@ -211,10 +300,31 @@ def main(argv: list[str] | None = None) -> int:
     env_cfg = RoutingEnvConfig(frontier_size=4)
 
     rows = []
+    aer_device_counts = {"gpu": 0, "cpu": 0}
+    cpu_count = os.cpu_count() or 1
+    max_parallel_threads = (
+        max(1, int(args.aer_max_parallel_threads))
+        if args.aer_max_parallel_threads is not None
+        else max(1, cpu_count)
+    )
+    max_parallel_experiments = (
+        max(1, int(args.aer_max_parallel_experiments))
+        if args.aer_max_parallel_experiments is not None
+        else max(1, min(16, cpu_count))
+    )
     for circuit, topo_id, cmap in selected:
         hw = _hardware_for_graph(topo_id, cmap, seed=args.hardware_seed)
         noise_model = _noise_model_from_hardware(hw, seed=args.hardware_seed)
-        sim = AerSimulator(noise_model=noise_model)
+        sim, aer_device = _create_aer_simulator(
+            noise_model,
+            device_pref=args.aer_device,
+            method=args.aer_method,
+            precision=args.aer_precision,
+            strict_device=args.aer_strict_device,
+            max_parallel_threads=max_parallel_threads,
+            max_parallel_experiments=max_parallel_experiments,
+        )
+        aer_device_counts[aer_device] = aer_device_counts.get(aer_device, 0) + 1
         baselines = [
             run_best_available_sabre(
                 circuit.circuit, cmap, seed=args.selection_seed, hardware_model=hw
@@ -270,6 +380,7 @@ def main(argv: list[str] | None = None) -> int:
                     "empirical": empirical,
                     "swaps": None if result.metrics is None else result.metrics.swaps,
                     "runtime_s": result.runtime_s,
+                    "aer_device": aer_device,
                 }
             )
 
@@ -284,6 +395,12 @@ def main(argv: list[str] | None = None) -> int:
         "num_pairs": len(df),
         "graphs": sorted(df["graph_id"].unique()),
         "correlations_csv": str(out_dir / "correlations.csv"),
+        "aer_device_requested": args.aer_device,
+        "aer_method": args.aer_method,
+        "aer_precision": args.aer_precision,
+        "aer_device_counts": aer_device_counts,
+        "aer_max_parallel_threads": max_parallel_threads,
+        "aer_max_parallel_experiments": max_parallel_experiments,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     print(f"[proxy_validation] wrote {len(df)} rows to {out_dir}")
